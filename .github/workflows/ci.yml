@@ -1,0 +1,27 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  rust:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy,rustfmt
+      - name: Install native dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libgtk-4-dev libgstreamer1.0-dev libsecret-1-dev \
+            gstreamer1.0-plugins-base gstreamer1.0-plugins-good
+      - run: cargo fmt --all --check
+      - run: cargo check --workspace
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo test --workspace
