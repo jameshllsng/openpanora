@@ -12,7 +12,7 @@ use rand::RngCore;
 use reqwest::{StatusCode, header};
 use roxmltree::{Document, Node};
 use sha1::{Digest, Sha1};
-use std::{collections::HashSet, fmt::Write, time::Duration};
+use std::{collections::HashSet, fmt::Write, path::Path, time::Duration};
 use thiserror::Error;
 use url::Url;
 
@@ -36,6 +36,8 @@ pub enum ProbeError {
     Tls(String),
     #[error("request timed out")]
     Timeout,
+    #[error("operation was cancelled")]
+    Cancelled,
     #[error("device does not support the requested operation: {0}")]
     Unsupported(String),
     #[error("malformed device response: {0}")]
@@ -82,15 +84,29 @@ impl HttpSoapTransport {
         timeout: Duration,
         credentials: Option<Credentials>,
         insecure_tls: bool,
+        tls_ca_file: Option<&Path>,
     ) -> Result<Self, ProbeError> {
-        let client = reqwest::Client::builder()
+        let mut builder = reqwest::Client::builder()
             .timeout(timeout)
             .redirect(reqwest::redirect::Policy::none())
             .danger_accept_invalid_certs(insecure_tls)
             .user_agent(concat!(
                 "OpenPanora-device-probe/",
                 env!("CARGO_PKG_VERSION")
-            ))
+            ));
+        if let Some(path) = tls_ca_file {
+            let pem = std::fs::read(path).map_err(|error| {
+                ProbeError::Input(format!(
+                    "could not read --tls-ca-file {}: {error}",
+                    path.display()
+                ))
+            })?;
+            let certificate = reqwest::Certificate::from_pem(&pem).map_err(|error| {
+                ProbeError::Input(format!("--tls-ca-file is not a PEM certificate: {error}"))
+            })?;
+            builder = builder.add_root_certificate(certificate);
+        }
+        let client = builder
             .build()
             .map_err(|error| ProbeError::Transport(error.to_string()))?;
         Ok(Self {
@@ -378,14 +394,21 @@ pub struct OnvifClient<T> {
     transport: T,
     device_endpoint: Url,
     credentials: Option<Credentials>,
+    allowed_service_host: Option<String>,
 }
 
 impl<T: SoapTransport> OnvifClient<T> {
-    pub fn new(transport: T, device_endpoint: Url, credentials: Option<Credentials>) -> Self {
+    pub fn new(
+        transport: T,
+        device_endpoint: Url,
+        credentials: Option<Credentials>,
+        allowed_service_host: Option<String>,
+    ) -> Self {
         Self {
             transport,
             device_endpoint,
             credentials,
+            allowed_service_host,
         }
     }
 
@@ -479,7 +502,11 @@ impl<T: SoapTransport> OnvifClient<T> {
             service.namespace.contains("/media/wsdl") || service.namespace.contains("/media2/wsdl")
         });
         let media_profiles = if let Some(service) = media_service {
-            match validated_service_endpoint(&self.device_endpoint, &service.endpoint) {
+            match validated_service_endpoint(
+                &self.device_endpoint,
+                &service.endpoint,
+                self.allowed_service_host.as_deref(),
+            ) {
                 Ok(endpoint) => match self.media_profiles(&endpoint, &service.namespace).await {
                     Ok(profiles) => {
                         let status = if profiles.is_empty() {
@@ -563,7 +590,7 @@ impl<T: SoapTransport> OnvifClient<T> {
     async fn device_information(&self) -> Result<DeviceInformation, ProbeError> {
         let body = format!("<tds:GetDeviceInformation xmlns:tds=\"{DEVICE_NS}\"/>");
         let response = self
-            .call(
+            .call_service(
                 &self.device_endpoint,
                 &format!("{DEVICE_NS}/GetDeviceInformation"),
                 &body,
@@ -572,12 +599,12 @@ impl<T: SoapTransport> OnvifClient<T> {
         parse_device_information(&response)
     }
 
-    async fn services(&self) -> Result<Vec<ServiceEndpoint>, ProbeError> {
+    pub(crate) async fn services(&self) -> Result<Vec<ServiceEndpoint>, ProbeError> {
         let body = format!(
             "<tds:GetServices xmlns:tds=\"{DEVICE_NS}\"><tds:IncludeCapability>true</tds:IncludeCapability></tds:GetServices>"
         );
         let response = self
-            .call(
+            .call_service(
                 &self.device_endpoint,
                 &format!("{DEVICE_NS}/GetServices"),
                 &body,
@@ -601,12 +628,17 @@ impl<T: SoapTransport> OnvifClient<T> {
             escape(namespace)
         );
         let response = self
-            .call(endpoint, &format!("{namespace}/GetProfiles"), &body)
+            .call_service(endpoint, &format!("{namespace}/GetProfiles"), &body)
             .await?;
         parse_media_profiles(&response)
     }
 
-    async fn call(&self, endpoint: &Url, action: &str, body: &str) -> Result<String, ProbeError> {
+    pub(crate) async fn call_service(
+        &self,
+        endpoint: &Url,
+        action: &str,
+        body: &str,
+    ) -> Result<String, ProbeError> {
         self.transport
             .post(
                 endpoint,
@@ -614,6 +646,42 @@ impl<T: SoapTransport> OnvifClient<T> {
                 soap_envelope(body, self.credentials.as_ref()),
             )
             .await
+    }
+
+    pub(crate) fn validated_service_endpoint(&self, value: &str) -> Result<Url, ProbeError> {
+        validated_service_endpoint(
+            &self.device_endpoint,
+            value,
+            self.allowed_service_host.as_deref(),
+        )
+    }
+
+    pub(crate) fn validated_replay_uri(&self, value: &str) -> Result<Url, ProbeError> {
+        let uri = Url::parse(value)
+            .map_err(|error| ProbeError::Malformed(format!("invalid replay URI: {error}")))?;
+        if !matches!(uri.scheme(), "rtsp" | "rtsps") || uri.host_str().is_none() {
+            return Err(ProbeError::Malformed(
+                "replay URI must be an absolute RTSP or RTSPS URL".into(),
+            ));
+        }
+        if !uri.username().is_empty() || uri.password().is_some() {
+            return Err(ProbeError::Malformed(
+                "replay URI must not embed credentials".into(),
+            ));
+        }
+        let device_host = self.device_endpoint.host_str().unwrap_or_default();
+        let replay_host = uri.host_str().unwrap_or_default();
+        let explicitly_allowed = self
+            .allowed_service_host
+            .as_deref()
+            .is_some_and(|host| host.eq_ignore_ascii_case(replay_host));
+        if !device_host.eq_ignore_ascii_case(replay_host) && !explicitly_allowed {
+            return Err(ProbeError::Transport(
+                "refusing a replay URI hosted outside the selected device; use --allow-service-host to approve one host"
+                    .into(),
+            ));
+        }
+        Ok(uri)
     }
 }
 
@@ -714,7 +782,11 @@ fn sanitize_endpoint(value: &str) -> String {
     url.to_string()
 }
 
-fn validated_service_endpoint(device_endpoint: &Url, value: &str) -> Result<Url, ProbeError> {
+fn validated_service_endpoint(
+    device_endpoint: &Url,
+    value: &str,
+    allowed_service_host: Option<&str>,
+) -> Result<Url, ProbeError> {
     let endpoint = Url::parse(value)
         .map_err(|error| ProbeError::Malformed(format!("invalid service XAddr: {error}")))?;
     if !matches!(endpoint.scheme(), "http" | "https") || endpoint.host_str().is_none() {
@@ -730,6 +802,16 @@ fn validated_service_endpoint(device_endpoint: &Url, value: &str) -> Result<Url,
     if device_endpoint.scheme() == "https" && endpoint.scheme() != "https" {
         return Err(ProbeError::Transport(
             "refusing an HTTPS-to-HTTP ONVIF service downgrade".into(),
+        ));
+    }
+    let device_host = device_endpoint.host_str().unwrap_or_default();
+    let service_host = endpoint.host_str().unwrap_or_default();
+    let explicitly_allowed =
+        allowed_service_host.is_some_and(|host| host.eq_ignore_ascii_case(service_host));
+    if !device_host.eq_ignore_ascii_case(service_host) && !explicitly_allowed {
+        return Err(ProbeError::Transport(
+            "refusing a service XAddr hosted outside the selected device; use --allow-service-host to approve one host"
+                .into(),
         ));
     }
     Ok(endpoint)
@@ -835,6 +917,7 @@ mod tests {
                 ),
             },
             Url::parse("http://camera.test/onvif/device_service").unwrap(),
+            None,
             None,
         )
     }
@@ -1000,6 +1083,7 @@ mod tests {
                 password: "s3cret".into(),
             }),
             false,
+            None,
         )
         .unwrap();
         let endpoint = Url::parse(&format!("http://{address}/onvif/device_service")).unwrap();
@@ -1029,6 +1113,19 @@ mod tests {
     #[test]
     fn rejects_service_https_downgrade() {
         let device = Url::parse("https://camera.test/onvif/device_service").unwrap();
-        assert!(validated_service_endpoint(&device, "http://camera.test/onvif/media").is_err());
+        assert!(
+            validated_service_endpoint(&device, "http://camera.test/onvif/media", None).is_err()
+        );
+    }
+
+    #[test]
+    fn rejects_missing_explicit_ca_file() {
+        let result = HttpSoapTransport::new(
+            Duration::from_secs(1),
+            None,
+            false,
+            Some(std::path::Path::new("/tmp/openpanora-no-such-ca.pem")),
+        );
+        assert!(matches!(result, Err(ProbeError::Input(_))));
     }
 }

@@ -1,6 +1,7 @@
 use crate::onvif::ProbeError;
+use chrono::{DateTime, Utc};
 use clap::{Args, Parser, Subcommand};
-use std::{net::IpAddr, time::Duration};
+use std::{net::IpAddr, path::PathBuf, time::Duration};
 use url::Url;
 
 #[derive(Debug, Parser)]
@@ -36,40 +37,101 @@ pub enum Command {
     Capabilities(DeviceArgs),
     /// Open and decode an RTSP stream with GStreamer; a TCP connection alone is not success.
     RtspTest(RtspArgs),
+    /// Execute read-only ONVIF Recording Search and Replay Control diagnostics.
+    Recordings(RecordingsArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct RecordingsArgs {
+    #[command(flatten)]
+    pub device: DeviceArgs,
+    #[command(subcommand)]
+    pub command: RecordingsCommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum RecordingsCommand {
+    /// Get the device-wide recording time range and count.
+    Summary,
+    /// List recording configurations exposed by Recording Control.
+    List,
+    /// Find recordings, fetch metadata, and optionally filter by a UTC interval.
+    Search(RecordingSearchArgs),
+    /// Request a read-only replay URI for one recording token.
+    ReplayUri(ReplayArgs),
+    /// Read Replay Control configuration without changing it.
+    ReplayConfiguration,
+    /// Request a replay URI and require GStreamer to decode a media buffer.
+    ReplayTest(ReplayArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct RecordingSearchArgs {
+    /// Inclusive UTC start time (RFC 3339), used to filter discovered recording intervals.
+    #[arg(long, value_parser = parse_utc)]
+    pub start: Option<DateTime<Utc>>,
+
+    /// Exclusive UTC end time (RFC 3339), used to filter discovered recording intervals.
+    #[arg(long, value_parser = parse_utc)]
+    pub end: Option<DateTime<Utc>>,
+
+    /// Upper bound for recordings returned and metadata requests.
+    #[arg(long, default_value_t = 32, value_parser = clap::value_parser!(u32).range(1..=128))]
+    pub limit: u32,
+}
+
+#[derive(Debug, Args)]
+pub struct ReplayArgs {
+    /// Recording token returned by `recordings list` or `recordings search`.
+    #[arg(long)]
+    pub recording_token: String,
 }
 
 #[derive(Debug, Clone, Args)]
 pub struct DeviceArgs {
     /// A single IPv4, IPv6, or DNS host. Schemes and paths are rejected.
-    #[arg(long, required_unless_present = "service_url")]
+    #[arg(long, global = true)]
     pub host: Option<String>,
 
     /// Explicit ONVIF Device Management URL. This replaces --host/--port/--https.
-    #[arg(long, conflicts_with_all = ["host", "port", "https"], value_parser = parse_onvif_url)]
+    #[arg(long, global = true, conflicts_with_all = ["host", "port", "https"], value_parser = parse_onvif_url)]
     pub service_url: Option<Url>,
 
     /// ONVIF HTTP(S) port.
-    #[arg(long, default_value_t = 80)]
+    #[arg(long, global = true, default_value_t = 80)]
     pub port: u16,
 
     /// Use HTTPS for the ONVIF Device Management endpoint.
-    #[arg(long)]
+    #[arg(long, global = true)]
     pub https: bool,
 
     /// Disable TLS certificate verification for a local diagnostic only.
-    #[arg(long)]
+    #[arg(long, global = true, conflicts_with = "tls_ca_file")]
     pub insecure_tls: bool,
 
+    /// PEM certificate authority file trusted for this diagnostic connection.
+    #[arg(long, global = true, conflicts_with = "insecure_tls")]
+    pub tls_ca_file: Option<PathBuf>,
+
+    /// Explicitly allow service XAddr URLs hosted by this one alternate host.
+    #[arg(long, global = true)]
+    pub allow_service_host: Option<String>,
+
     /// ONVIF username. The password is read securely unless another source is selected.
-    #[arg(long)]
+    #[arg(long, global = true)]
     pub username: Option<String>,
 
     /// Read exactly one password line from standard input.
-    #[arg(long, requires = "username", conflicts_with = "keyring")]
+    #[arg(long, global = true, requires = "username", conflicts_with = "keyring")]
     pub password_stdin: bool,
 
     /// Read the password from Linux Secret Service, keyed by host and username.
-    #[arg(long, requires = "username", conflicts_with = "password_stdin")]
+    #[arg(
+        long,
+        global = true,
+        requires = "username",
+        conflicts_with = "password_stdin"
+    )]
     pub keyring: bool,
 }
 
@@ -108,6 +170,13 @@ impl DeviceArgs {
             .host_str()
             .ok_or_else(|| ProbeError::Input("ONVIF service URL must include a host".into()))?
             .to_owned())
+    }
+
+    pub fn allowed_service_host(&self) -> Result<Option<String>, ProbeError> {
+        if let Some(host) = &self.allow_service_host {
+            validate_host(host)?;
+        }
+        Ok(self.allow_service_host.clone())
     }
 }
 
@@ -151,6 +220,12 @@ fn parse_onvif_url(value: &str) -> Result<Url, String> {
     Ok(url)
 }
 
+fn parse_utc(value: &str) -> Result<DateTime<Utc>, String> {
+    DateTime::parse_from_rfc3339(value)
+        .map(|time| time.with_timezone(&Utc))
+        .map_err(|error| format!("expected an RFC 3339 UTC timestamp: {error}"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -163,6 +238,8 @@ mod tests {
             port: 8443,
             https: true,
             insecure_tls: false,
+            tls_ca_file: None,
+            allow_service_host: None,
             username: None,
             password_stdin: false,
             keyring: false,
@@ -181,6 +258,8 @@ mod tests {
             port: 80,
             https: false,
             insecure_tls: false,
+            tls_ca_file: None,
+            allow_service_host: None,
             username: None,
             password_stdin: false,
             keyring: false,
@@ -196,6 +275,8 @@ mod tests {
             port: 80,
             https: false,
             insecure_tls: true,
+            tls_ca_file: None,
+            allow_service_host: None,
             username: None,
             password_stdin: false,
             keyring: false,
@@ -214,10 +295,39 @@ mod tests {
             port: 80,
             https: false,
             insecure_tls: true,
+            tls_ca_file: None,
+            allow_service_host: None,
             username: None,
             password_stdin: false,
             keyring: false,
         };
         assert!(args.device_service_url().is_err());
+    }
+
+    #[test]
+    fn parses_utc_as_an_absolute_time() {
+        let utc = parse_utc("2026-01-02T03:04:05-03:00").unwrap();
+        assert_eq!(utc.to_rfc3339(), "2026-01-02T06:04:05+00:00");
+    }
+
+    #[test]
+    fn accepts_device_arguments_after_recording_subcommand() {
+        let cli = Cli::try_parse_from([
+            "device-probe",
+            "recordings",
+            "search",
+            "--service-url",
+            "https://camera.test/onvif/device_service",
+            "--username",
+            "operator",
+        ])
+        .unwrap();
+        let Command::Recordings(args) = cli.command else {
+            panic!("expected recordings command");
+        };
+        assert_eq!(
+            args.device.device_service_url().unwrap().as_str(),
+            "https://camera.test/onvif/device_service"
+        );
     }
 }

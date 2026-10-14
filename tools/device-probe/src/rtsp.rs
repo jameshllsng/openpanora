@@ -1,4 +1,4 @@
-use crate::onvif::ProbeError;
+use crate::{credentials::Credentials, onvif::ProbeError};
 use gst::prelude::*;
 use gstreamer as gst;
 use serde::Serialize;
@@ -18,13 +18,39 @@ pub struct RtspTestResult {
 }
 
 pub fn test(url: &Url, timeout: Duration) -> Result<RtspTestResult, ProbeError> {
+    test_internal(url, None, timeout)
+}
+
+pub fn test_with_credentials(
+    url: &Url,
+    credentials: Option<&Credentials>,
+    timeout: Duration,
+) -> Result<RtspTestResult, ProbeError> {
+    test_internal(url, credentials, timeout)
+}
+
+fn test_internal(
+    url: &Url,
+    credentials: Option<&Credentials>,
+    timeout: Duration,
+) -> Result<RtspTestResult, ProbeError> {
     gst::init().map_err(|error| ProbeError::Media(error.to_string()))?;
+
+    let mut playback_uri = url.clone();
+    if let Some(credentials) = credentials {
+        playback_uri
+            .set_username(&credentials.username)
+            .map_err(|_| ProbeError::Input("RTSP username cannot be represented safely".into()))?;
+        playback_uri
+            .set_password(Some(&credentials.password))
+            .map_err(|_| ProbeError::Input("RTSP password cannot be represented safely".into()))?;
+    }
 
     let observed = Arc::new(AtomicBool::new(false));
     let video_sink = fake_sink(observed.clone())?;
     let audio_sink = fake_sink(observed.clone())?;
     let playbin = gst::ElementFactory::make("playbin")
-        .property("uri", url.as_str())
+        .property("uri", playback_uri.as_str())
         .property("video-sink", &video_sink)
         .property("audio-sink", &audio_sink)
         .build()
@@ -54,11 +80,7 @@ pub fn test(url: &Url, timeout: Duration) -> Result<RtspTestResult, ProbeError> 
         )) {
             match message.view() {
                 gst::MessageView::Error(error) => {
-                    let message = error.error().to_string();
-                    if message.to_ascii_lowercase().contains("unauthorized") {
-                        break Err(ProbeError::Authentication);
-                    }
-                    break Err(ProbeError::Media(message));
+                    break Err(classify_stream_error(&error.error().to_string()));
                 }
                 gst::MessageView::Eos(_) if !observed.load(Ordering::Acquire) => {
                     break Err(ProbeError::Media(
@@ -74,6 +96,19 @@ pub fn test(url: &Url, timeout: Duration) -> Result<RtspTestResult, ProbeError> 
     outcome
 }
 
+fn classify_stream_error(message: &str) -> ProbeError {
+    let normalized = message.to_ascii_lowercase();
+    if normalized.contains("unauthorized") || normalized.contains("authentication") {
+        ProbeError::Authentication
+    } else if normalized.contains("not supported") || normalized.contains("unsupported") {
+        ProbeError::Unsupported(
+            "GStreamer reported an unsupported replay transport or codec".into(),
+        )
+    } else {
+        ProbeError::Media(message.into())
+    }
+}
+
 fn fake_sink(observed: Arc<AtomicBool>) -> Result<gst::Element, ProbeError> {
     let sink = gst::ElementFactory::make("fakesink")
         .property("sync", false)
@@ -85,4 +120,25 @@ fn fake_sink(observed: Arc<AtomicBool>) -> Result<gst::Element, ProbeError> {
         None
     });
     Ok(sink)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn classifies_replay_stream_errors_without_a_pipeline() {
+        assert!(matches!(
+            classify_stream_error("Unauthorized"),
+            ProbeError::Authentication
+        ));
+        assert!(matches!(
+            classify_stream_error("transport not supported"),
+            ProbeError::Unsupported(_)
+        ));
+        assert!(matches!(
+            classify_stream_error("connection reset"),
+            ProbeError::Media(_)
+        ));
+    }
 }
