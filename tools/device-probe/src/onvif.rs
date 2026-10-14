@@ -2,16 +2,17 @@ use crate::credentials::Credentials;
 use async_trait::async_trait;
 use base64::{Engine, engine::general_purpose::STANDARD};
 use chrono::{SecondsFormat, Utc};
+use md5::Md5;
 use openpanora_core::{
     Capability, CapabilityKind, CompatibilityReport, DeviceInformation, MediaProfile,
     ServiceEndpoint, SupportStatus,
 };
 use quick_xml::escape::escape;
 use rand::RngCore;
-use reqwest::StatusCode;
+use reqwest::{StatusCode, header};
 use roxmltree::{Document, Node};
 use sha1::{Digest, Sha1};
-use std::{collections::HashSet, time::Duration};
+use std::{collections::HashSet, fmt::Write, time::Duration};
 use thiserror::Error;
 use url::Url;
 
@@ -23,6 +24,16 @@ pub enum ProbeError {
     Input(String),
     #[error("authentication is required or was rejected")]
     Authentication,
+    #[error("HTTP Digest credentials were rejected")]
+    InvalidCredentials,
+    #[error("HTTP 401 Unauthorized")]
+    HttpUnauthorized,
+    #[error("HTTP 403 Forbidden")]
+    HttpForbidden,
+    #[error("device requires HTTPS transport (SOAP ter:TransModeError)")]
+    TransportMode,
+    #[error("TLS certificate validation failed: {0}")]
+    Tls(String),
     #[error("request timed out")]
     Timeout,
     #[error("device does not support the requested operation: {0}")]
@@ -42,7 +53,7 @@ pub enum ProbeError {
 impl ProbeError {
     pub fn exit_code(&self) -> u8 {
         match self {
-            Self::Authentication => 4,
+            Self::Authentication | Self::InvalidCredentials | Self::HttpUnauthorized => 4,
             Self::Timeout => 5,
             Self::Unsupported(_) => 6,
             Self::Input(_) => 2,
@@ -63,19 +74,50 @@ pub trait SoapTransport: Send + Sync {
 
 pub struct HttpSoapTransport {
     client: reqwest::Client,
+    credentials: Option<Credentials>,
 }
 
 impl HttpSoapTransport {
-    pub fn new(timeout: Duration) -> Result<Self, ProbeError> {
+    pub fn new(
+        timeout: Duration,
+        credentials: Option<Credentials>,
+        insecure_tls: bool,
+    ) -> Result<Self, ProbeError> {
         let client = reqwest::Client::builder()
             .timeout(timeout)
+            .redirect(reqwest::redirect::Policy::none())
+            .danger_accept_invalid_certs(insecure_tls)
             .user_agent(concat!(
                 "OpenPanora-device-probe/",
                 env!("CARGO_PKG_VERSION")
             ))
             .build()
             .map_err(|error| ProbeError::Transport(error.to_string()))?;
-        Ok(Self { client })
+        Ok(Self {
+            client,
+            credentials,
+        })
+    }
+
+    async fn send(
+        &self,
+        endpoint: &Url,
+        action: &str,
+        envelope: String,
+        authorization: Option<String>,
+    ) -> Result<reqwest::Response, ProbeError> {
+        let mut request = self.client.post(endpoint.clone()).header(
+            header::CONTENT_TYPE,
+            format!("application/soap+xml; charset=utf-8; action=\"{action}\""),
+        );
+        if let Some(authorization) = authorization {
+            request = request.header(header::AUTHORIZATION, authorization);
+        }
+        request
+            .body(envelope)
+            .send()
+            .await
+            .map_err(classify_reqwest_error)
     }
 }
 
@@ -87,45 +129,19 @@ impl SoapTransport for HttpSoapTransport {
         action: &str,
         envelope: String,
     ) -> Result<String, ProbeError> {
-        let response = self
-            .client
-            .post(endpoint.clone())
-            .header(
-                reqwest::header::CONTENT_TYPE,
-                format!("application/soap+xml; charset=utf-8; action=\"{action}\""),
-            )
-            .body(envelope)
-            .send()
-            .await
-            .map_err(classify_reqwest_error)?;
-
-        if matches!(
-            response.status(),
-            StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN
-        ) {
-            return Err(ProbeError::Authentication);
+        let response = self.send(endpoint, action, envelope.clone(), None).await?;
+        if response.status() == StatusCode::UNAUTHORIZED {
+            let Some(credentials) = &self.credentials else {
+                return Err(ProbeError::HttpUnauthorized);
+            };
+            let challenge = digest_challenge(response.headers())?;
+            let authorization = digest_authorization(credentials, endpoint, &challenge, "POST", 1)?;
+            let retry = self
+                .send(endpoint, action, envelope, Some(authorization))
+                .await?;
+            return classify_response(retry, true).await;
         }
-        let status = response.status();
-        let body = response.text().await.map_err(classify_reqwest_error)?;
-        if body.to_ascii_lowercase().contains("notauthorized")
-            || body.to_ascii_lowercase().contains("ter:notauthorized")
-        {
-            return Err(ProbeError::Authentication);
-        }
-        if !status.is_success() {
-            return Err(ProbeError::Transport(format!(
-                "device returned HTTP {status}"
-            )));
-        }
-        if let Ok(document) = Document::parse(&body)
-            && document
-                .descendants()
-                .any(|node| node.has_tag_name("Fault"))
-        {
-            let reason = find_text(document.root(), "Text").unwrap_or("unspecified SOAP fault");
-            return Err(ProbeError::Unsupported(reason.to_owned()));
-        }
-        Ok(body)
+        classify_response(response, false).await
     }
 }
 
@@ -133,7 +149,228 @@ fn classify_reqwest_error(error: reqwest::Error) -> ProbeError {
     if error.is_timeout() {
         ProbeError::Timeout
     } else {
-        ProbeError::Transport(error.to_string())
+        classify_transport_message(&error.to_string())
+    }
+}
+
+fn classify_transport_message(message: &str) -> ProbeError {
+    let normalized = message.to_ascii_lowercase();
+    if normalized.contains("certificate")
+        || normalized.contains("tls")
+        || normalized.contains("ssl")
+        || normalized.contains("rustls")
+    {
+        ProbeError::Tls("certificate or TLS handshake validation failed".into())
+    } else {
+        ProbeError::Transport(message.into())
+    }
+}
+
+async fn classify_response(
+    response: reqwest::Response,
+    was_digest_attempt: bool,
+) -> Result<String, ProbeError> {
+    let status = response.status();
+    let body = response.text().await.map_err(classify_reqwest_error)?;
+    if let Some(error) = soap_fault_error(&body) {
+        return Err(error);
+    }
+    match status {
+        StatusCode::UNAUTHORIZED if was_digest_attempt => Err(ProbeError::InvalidCredentials),
+        StatusCode::UNAUTHORIZED => Err(ProbeError::HttpUnauthorized),
+        StatusCode::FORBIDDEN => Err(ProbeError::HttpForbidden),
+        status if !status.is_success() => Err(ProbeError::Transport(format!(
+            "device returned HTTP {status}"
+        ))),
+        _ => Ok(body),
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DigestChallenge {
+    realm: String,
+    nonce: String,
+    opaque: Option<String>,
+    algorithm: String,
+}
+
+fn digest_challenge(headers: &header::HeaderMap) -> Result<DigestChallenge, ProbeError> {
+    let value = headers
+        .get_all(header::WWW_AUTHENTICATE)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .find(|value| {
+            value
+                .trim_start()
+                .to_ascii_lowercase()
+                .starts_with("digest ")
+        })
+        .ok_or_else(|| {
+            ProbeError::Unsupported("HTTP 401 did not advertise HTTP Digest authentication".into())
+        })?;
+    let parameters = parse_digest_parameters(value.trim_start()[6..].trim());
+    let realm = parameters
+        .get("realm")
+        .filter(|value| !value.is_empty())
+        .cloned()
+        .ok_or_else(|| ProbeError::Malformed("Digest challenge omitted realm".into()))?;
+    let nonce = parameters
+        .get("nonce")
+        .filter(|value| !value.is_empty())
+        .cloned()
+        .ok_or_else(|| ProbeError::Malformed("Digest challenge omitted nonce".into()))?;
+    let qop_auth = parameters
+        .get("qop")
+        .is_some_and(|value| value.split(',').any(|item| item.trim() == "auth"));
+    if !qop_auth {
+        return Err(ProbeError::Unsupported(
+            "HTTP Digest challenge does not support qop=auth".into(),
+        ));
+    }
+    let algorithm = parameters
+        .get("algorithm")
+        .map_or("MD5", String::as_str)
+        .to_ascii_uppercase();
+    if algorithm != "MD5" {
+        return Err(ProbeError::Unsupported(format!(
+            "HTTP Digest algorithm {algorithm} is not supported"
+        )));
+    }
+    Ok(DigestChallenge {
+        realm,
+        nonce,
+        opaque: parameters.get("opaque").cloned(),
+        algorithm,
+    })
+}
+
+fn parse_digest_parameters(value: &str) -> std::collections::HashMap<String, String> {
+    let mut parameters = std::collections::HashMap::new();
+    let mut current = String::new();
+    let mut quoted = false;
+    let mut escaped = false;
+    for character in value.chars().chain(std::iter::once(',')) {
+        if escaped {
+            current.push(character);
+            escaped = false;
+        } else if character == '\\' && quoted {
+            escaped = true;
+        } else if character == '"' {
+            quoted = !quoted;
+            current.push(character);
+        } else if character == ',' && !quoted {
+            if let Some((key, value)) = current.trim().split_once('=') {
+                let value = value.trim().trim_matches('"').replace("\\\"", "\"");
+                parameters.insert(key.trim().to_ascii_lowercase(), value);
+            }
+            current.clear();
+        } else {
+            current.push(character);
+        }
+    }
+    parameters
+}
+
+fn digest_authorization(
+    credentials: &Credentials,
+    endpoint: &Url,
+    challenge: &DigestChallenge,
+    method: &str,
+    nonce_count: u32,
+) -> Result<String, ProbeError> {
+    let mut random = [0_u8; 16];
+    rand::rng().fill_bytes(&mut random);
+    let cnonce = hex(&random);
+    digest_authorization_with_cnonce(
+        credentials,
+        endpoint,
+        challenge,
+        method,
+        nonce_count,
+        &cnonce,
+    )
+}
+
+fn digest_authorization_with_cnonce(
+    credentials: &Credentials,
+    endpoint: &Url,
+    challenge: &DigestChallenge,
+    method: &str,
+    nonce_count: u32,
+    cnonce: &str,
+) -> Result<String, ProbeError> {
+    let mut uri = endpoint.path().to_owned();
+    if let Some(query) = endpoint.query() {
+        uri.push('?');
+        uri.push_str(query);
+    }
+    if uri.is_empty() {
+        uri.push('/');
+    }
+    let ha1 = md5_hex(&format!(
+        "{}:{}:{}",
+        credentials.username, challenge.realm, credentials.password
+    ));
+    let ha2 = md5_hex(&format!("{method}:{uri}"));
+    let nc = format!("{nonce_count:08x}");
+    let response = md5_hex(&format!(
+        "{ha1}:{}:{nc}:{cnonce}:auth:{ha2}",
+        challenge.nonce
+    ));
+    let mut header = format!(
+        "Digest username=\"{}\", realm=\"{}\", nonce=\"{}\", uri=\"{}\", response=\"{response}\", algorithm={}, qop=auth, nc={nc}, cnonce=\"{cnonce}\"",
+        escape_digest(&credentials.username),
+        escape_digest(&challenge.realm),
+        escape_digest(&challenge.nonce),
+        escape_digest(&uri),
+        challenge.algorithm,
+    );
+    if let Some(opaque) = &challenge.opaque {
+        write!(header, ", opaque=\"{}\"", escape_digest(opaque))
+            .map_err(|error| ProbeError::Transport(error.to_string()))?;
+    }
+    Ok(header)
+}
+
+fn md5_hex(value: &str) -> String {
+    let mut hasher = Md5::new();
+    hasher.update(value.as_bytes());
+    hex(&hasher.finalize())
+}
+
+fn hex(bytes: &[u8]) -> String {
+    let mut output = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        let _ = write!(output, "{byte:02x}");
+    }
+    output
+}
+
+fn escape_digest(value: &str) -> String {
+    value.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
+fn soap_fault_error(xml: &str) -> Option<ProbeError> {
+    let document = Document::parse(xml).ok()?;
+    let fault = document
+        .descendants()
+        .find(|node| node.is_element() && node.tag_name().name() == "Fault")?;
+    let values = fault
+        .descendants()
+        .filter_map(|node| node.text())
+        .collect::<Vec<_>>()
+        .join(" ");
+    let normalized = values.to_ascii_lowercase();
+    if normalized.contains("notauthorized") {
+        Some(ProbeError::Authentication)
+    } else if normalized.contains("transmodeerror") {
+        Some(ProbeError::TransportMode)
+    } else {
+        Some(ProbeError::Unsupported(
+            find_text(fault, "Text")
+                .unwrap_or("unspecified SOAP fault")
+                .to_owned(),
+        ))
     }
 }
 
@@ -163,7 +400,7 @@ impl<T: SoapTransport> OnvifClient<T> {
                 ));
                 Some(information)
             }
-            Err(ProbeError::Authentication) => {
+            Err(ProbeError::Authentication | ProbeError::HttpUnauthorized) => {
                 capabilities.push(capability(
                     CapabilityKind::DeviceInformation,
                     SupportStatus::AuthenticationRequired,
@@ -171,6 +408,7 @@ impl<T: SoapTransport> OnvifClient<T> {
                 ));
                 None
             }
+            Err(ProbeError::InvalidCredentials) => return Err(ProbeError::InvalidCredentials),
             Err(ProbeError::Timeout) => return Err(ProbeError::Timeout),
             Err(error) => {
                 capabilities.push(capability(
@@ -184,7 +422,7 @@ impl<T: SoapTransport> OnvifClient<T> {
 
         let services = match self.services().await {
             Ok(services) => services,
-            Err(ProbeError::Authentication) => {
+            Err(ProbeError::Authentication | ProbeError::HttpUnauthorized) => {
                 append_auth_required_capabilities(&mut capabilities);
                 return Ok(CompatibilityReport {
                     device,
@@ -193,6 +431,7 @@ impl<T: SoapTransport> OnvifClient<T> {
                     capabilities,
                 });
             }
+            Err(ProbeError::InvalidCredentials) => return Err(ProbeError::InvalidCredentials),
             Err(ProbeError::Timeout) => return Err(ProbeError::Timeout),
             Err(error) => {
                 append_unverified_capabilities(&mut capabilities, &error.to_string());
@@ -222,12 +461,14 @@ impl<T: SoapTransport> OnvifClient<T> {
             capabilities.push(capability(
                 kind,
                 if supported {
-                    SupportStatus::Supported
+                    SupportStatus::Unverified
                 } else {
                     SupportStatus::Unsupported
                 },
                 if supported {
-                    format!("GetServices advertised {needle}")
+                    format!(
+                        "GetServices advertised {needle}; the service operation was not executed"
+                    )
                 } else {
                     format!("GetServices did not advertise {needle}")
                 },
@@ -238,7 +479,7 @@ impl<T: SoapTransport> OnvifClient<T> {
             service.namespace.contains("/media/wsdl") || service.namespace.contains("/media2/wsdl")
         });
         let media_profiles = if let Some(service) = media_service {
-            match Url::parse(&service.endpoint) {
+            match validated_service_endpoint(&self.device_endpoint, &service.endpoint) {
                 Ok(endpoint) => match self.media_profiles(&endpoint, &service.namespace).await {
                     Ok(profiles) => {
                         let status = if profiles.is_empty() {
@@ -258,7 +499,7 @@ impl<T: SoapTransport> OnvifClient<T> {
                         ));
                         profiles
                     }
-                    Err(ProbeError::Authentication) => {
+                    Err(ProbeError::Authentication | ProbeError::HttpUnauthorized) => {
                         capabilities.push(capability(
                             CapabilityKind::MediaProfiles,
                             SupportStatus::AuthenticationRequired,
@@ -270,6 +511,9 @@ impl<T: SoapTransport> OnvifClient<T> {
                             "stream URI retrieval requires valid credentials",
                         ));
                         Vec::new()
+                    }
+                    Err(ProbeError::InvalidCredentials) => {
+                        return Err(ProbeError::InvalidCredentials);
                     }
                     Err(error) => {
                         capabilities.push(capability(
@@ -470,6 +714,27 @@ fn sanitize_endpoint(value: &str) -> String {
     url.to_string()
 }
 
+fn validated_service_endpoint(device_endpoint: &Url, value: &str) -> Result<Url, ProbeError> {
+    let endpoint = Url::parse(value)
+        .map_err(|error| ProbeError::Malformed(format!("invalid service XAddr: {error}")))?;
+    if !matches!(endpoint.scheme(), "http" | "https") || endpoint.host_str().is_none() {
+        return Err(ProbeError::Malformed(
+            "service XAddr must be an absolute HTTP(S) URL".into(),
+        ));
+    }
+    if !endpoint.username().is_empty() || endpoint.password().is_some() {
+        return Err(ProbeError::Malformed(
+            "service XAddr must not contain credentials".into(),
+        ));
+    }
+    if device_endpoint.scheme() == "https" && endpoint.scheme() != "https" {
+        return Err(ProbeError::Transport(
+            "refusing an HTTPS-to-HTTP ONVIF service downgrade".into(),
+        ));
+    }
+    Ok(endpoint)
+}
+
 fn find_text<'a, 'input>(node: Node<'a, 'input>, name: &str) -> Option<&'a str> {
     node.descendants()
         .find(|candidate| candidate.is_element() && candidate.tag_name().name() == name)
@@ -537,7 +802,11 @@ fn remaining_capability_kinds(capabilities: &[Capability]) -> Vec<CapabilityKind
 mod tests {
     use super::*;
     use pretty_assertions::assert_eq;
-    use std::{collections::VecDeque, sync::Mutex};
+    use std::{collections::VecDeque, sync::Mutex, time::Duration};
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::TcpListener,
+    };
 
     struct MockTransport {
         responses: Mutex<VecDeque<Result<String, ProbeError>>>,
@@ -605,9 +874,9 @@ mod tests {
         };
         assert_eq!(
             status(CapabilityKind::RecordingSearch),
-            SupportStatus::Supported
+            SupportStatus::Unverified
         );
-        assert_eq!(status(CapabilityKind::Replay), SupportStatus::Supported);
+        assert_eq!(status(CapabilityKind::Replay), SupportStatus::Unverified);
         assert_eq!(
             status(CapabilityKind::RecordingControl),
             SupportStatus::Unsupported
@@ -661,5 +930,105 @@ mod tests {
         });
         assert!(header.contains("PasswordDigest"));
         assert!(!header.contains("do-not-leak"));
+    }
+
+    #[test]
+    fn parses_and_calculates_digest_qop_auth() {
+        let mut headers = header::HeaderMap::new();
+        headers.insert(
+            header::WWW_AUTHENTICATE,
+            "Digest realm=\"testrealm@host.com\", qop=\"auth,auth-int\", nonce=\"dcd98b7102dd2f0e8b11d0f600bfb0c093\", opaque=\"5ccc069c403ebaf9f0171e9517f40e41\""
+                .parse()
+                .unwrap(),
+        );
+        let challenge = digest_challenge(&headers).unwrap();
+        let header = digest_authorization_with_cnonce(
+            &Credentials {
+                username: "Mufasa".into(),
+                password: "Circle Of Life".into(),
+            },
+            &Url::parse("http://www.example.com/dir/index.html").unwrap(),
+            &challenge,
+            "GET",
+            1,
+            "0a4f113b",
+        )
+        .unwrap();
+        assert!(header.contains("qop=auth"));
+        assert!(header.contains("response=\"6629fae49393a05397450978507c4ef1\""));
+        assert!(!header.contains("Circle Of Life"));
+    }
+
+    #[tokio::test]
+    async fn http_transport_retries_with_digest_authorization() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut first, _) = listener.accept().await.unwrap();
+            let mut first_request = [0_u8; 4096];
+            let bytes = first.read(&mut first_request).await.unwrap();
+            assert!(
+                std::str::from_utf8(&first_request[..bytes])
+                    .unwrap()
+                    .contains("POST /onvif")
+            );
+            first
+                .write_all(b"HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Digest realm=\"camera\", nonce=\"nonce\", qop=\"auth\"\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                .await
+                .unwrap();
+
+            let (mut second, _) = listener.accept().await.unwrap();
+            let mut second_request = [0_u8; 4096];
+            let bytes = second.read(&mut second_request).await.unwrap();
+            let request = std::str::from_utf8(&second_request[..bytes]).unwrap();
+            let normalized = request.to_ascii_lowercase();
+            assert!(normalized.contains("authorization: digest"));
+            assert!(normalized.contains("qop=auth"));
+            assert!(!request.contains("s3cret"));
+            second
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\n<ok/>",
+                )
+                .await
+                .unwrap();
+        });
+
+        let transport = HttpSoapTransport::new(
+            Duration::from_secs(2),
+            Some(Credentials {
+                username: "operator".into(),
+                password: "s3cret".into(),
+            }),
+            false,
+        )
+        .unwrap();
+        let endpoint = Url::parse(&format!("http://{address}/onvif/device_service")).unwrap();
+        assert_eq!(
+            transport
+                .post(&endpoint, "urn:test", "<body/>".into())
+                .await
+                .unwrap(),
+            "<ok/>"
+        );
+        server.await.unwrap();
+    }
+
+    #[test]
+    fn classifies_soap_transport_mode_and_tls_failures() {
+        let trans_mode = r#"<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope"><s:Body><s:Fault><s:Code><s:Value>ter:TransModeError</s:Value></s:Code></s:Fault></s:Body></s:Envelope>"#;
+        assert!(matches!(
+            soap_fault_error(trans_mode),
+            Some(ProbeError::TransportMode)
+        ));
+        assert!(matches!(
+            classify_transport_message("error trying to connect: invalid peer certificate"),
+            ProbeError::Tls(_)
+        ));
+    }
+
+    #[test]
+    fn rejects_service_https_downgrade() {
+        let device = Url::parse("https://camera.test/onvif/device_service").unwrap();
+        assert!(validated_service_endpoint(&device, "http://camera.test/onvif/media").is_err());
     }
 }

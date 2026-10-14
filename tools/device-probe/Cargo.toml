@@ -11,6 +11,7 @@ chrono.workspace = true
 clap = { version = "4", features = ["derive"] }
 gstreamer = "0.24"
 keyring = { version = "3", features = ["linux-native"] }
+md-5 = "0.10"
 openpanora-core = { path = "../../crates/core" }
 quick-xml = "0.38"
 rand = "0.9"
@@ -21,7 +22,7 @@ serde.workspace = true
 serde_json.workspace = true
 sha1 = "0.10"
 thiserror.workspace = true
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
+tokio = { version = "1", features = ["io-util", "macros", "net", "rt-multi-thread", "time"] }
 url = "2"
 
 [dev-dependencies]

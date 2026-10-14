@@ -28,7 +28,8 @@ async fn run(cli: Cli) -> Result<(), ProbeError> {
         Command::Inspect(args) | Command::Capabilities(args) => {
             let credentials = credentials::load(&args)?;
             let endpoint = args.device_service_url()?;
-            let transport = HttpSoapTransport::new(timeout)?;
+            let transport =
+                HttpSoapTransport::new(timeout, credentials.clone(), args.insecure_tls)?;
             let client = OnvifClient::new(transport, endpoint, credentials);
             let report = client.inspect().await?;
             output::print_report(&report, json)?;

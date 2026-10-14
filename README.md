@@ -15,6 +15,8 @@ yet been verified against physical hardware.
   recording search, replay, and time-range export.
 - `device-probe`, which targets one explicitly supplied host and performs real
   ONVIF Device Management and Media requests.
+- HTTP Digest (`qop=auth`) negotiation for ONVIF services, while retaining
+  WS-Security PasswordDigest for devices that require SOAP authentication.
 - ONVIF service classification for Recording Search, Recording Control, Replay,
   Media, PTZ, and Events.
 - RTSP validation through GStreamer. Success requires a decoded media buffer,
@@ -73,12 +75,23 @@ supplied by the operator.
 ```bash
 cargo run -p device-probe -- inspect --host 192.168.10.50
 cargo run -p device-probe -- capabilities --host 192.168.10.50 --username admin
+cargo run -p device-probe -- inspect --service-url 'https://camera.example/onvif/device_service' --username admin
 cargo run -p device-probe -- --timeout 20 rtsp-test --url 'rtsp://camera.example/stream'
 ```
 
 When `--username` is used, the password is prompted without echo. For
 automation, use `--password-stdin`, or retrieve an existing Secret Service entry
 with `--keyring`. Never put passwords in command-line URLs or repository files.
+
+HTTPS certificate verification is enabled by default. `--insecure-tls` is a
+deliberately explicit local-diagnostic escape hatch for a known, authorized
+device with a self-signed certificate; it must never be used as a deployment
+default. It is accepted only for HTTPS ONVIF endpoints.
+
+An advertised Recording Search, Recording Control, or Replay service is
+reported as **unverified** until its relevant operation has actually succeeded.
+The current probe intentionally does not attempt replay or recording-search
+operations without validated, sanitized fixtures.
 
 Exit codes are `0` for success, `2` for invalid input, `4` for authentication,
 `5` for timeouts, `6` for unsupported operations, and `1` for other failures.

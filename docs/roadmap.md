@@ -8,8 +8,8 @@ Statuses: **done**, **in progress**, **not started**, or **blocked on hardware**
 | Live viewing | in progress | probe decodes RTSP; embedded GTK video session remains |
 | 1/4/9/16/36 grids | not started | adaptive grid with substream policy and resource budget |
 | Device and channel management | in progress | domain types exist; ONVIF sync and CRUD UI remain |
-| Remote recording search | blocked on hardware | service discovery works; implement FindRecordings/GetRecordingSearchResults after fixtures from authorized devices |
-| Remote playback | blocked on hardware | Replay service is detected independently; implement GetReplayUri and GStreamer session |
+| Remote recording search | blocked on hardware | HTTPS/Digest service discovery works; implement FindRecordings/GetRecordingSearchResults after sanitized authorized-device fixtures |
+| Remote playback | blocked on hardware | Replay XAddr is detected independently but not treated as usable; implement GetReplayUri and GStreamer session after validated responses |
 | Calendar/timeline navigation | not started | depends on normalized recording results |
 | Time-range export | in progress | core contracts exist; remux/transcode job engine remains |
 | MP4 and compatible exports | not started | MP4 remux first; Matroska fallback; test timestamp discontinuities |
@@ -34,8 +34,8 @@ For every authorized model and firmware:
 7. For recording-capable devices, capture sanitized SOAP fixtures for
    FindRecordings, result paging, GetReplayUri, seek/range, and export behavior.
 
-Missing evidence today: no authorized physical device model/firmware responses,
-replay URIs, recording-search result shapes, range semantics, or export streams
-have been supplied. The next implementation step is to collect those sanitized
-fixtures with `device-probe`, then implement and contract-test the three ONVIF
-recording services without claiming Profile G universally.
+Missing evidence today: no sanitized Recording Search metadata/available
+interval responses, replay URIs, range semantics, or export streams have been
+supplied. The next implementation step is to collect those sanitized fixtures
+with `device-probe`, then implement and contract-test the three ONVIF recording
+services without claiming Profile G universally.

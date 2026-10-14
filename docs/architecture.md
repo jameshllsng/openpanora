@@ -38,6 +38,12 @@ or RTSP URL and never performs implicit network-wide discovery. It uses ONVIF
 SOAP calls to inventory services and media profiles and GStreamer to prove that
 an RTSP stream reaches decoded media buffers.
 
+Its ONVIF transport keeps HTTP and SOAP authentication independent. HTTPS is
+verified by default; HTTP Digest challenge-response is negotiated per request,
+and WS-Security UsernameToken PasswordDigest remains available as SOAP-layer
+authentication. A service XAddr is used only after validation, and an HTTPS
+Device Management endpoint is never downgraded to an HTTP service endpoint.
+
 ## Target component model
 
 ```text
