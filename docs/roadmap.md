@@ -8,10 +8,10 @@ Statuses: **done**, **in progress**, **not started**, or **blocked on hardware**
 | Live viewing | in progress | probe decodes RTSP; embedded GTK video session remains |
 | 1/4/9/16/36 grids | not started | adaptive grid with substream policy and resource budget |
 | Device and channel management | in progress | domain types exist; ONVIF sync and CRUD UI remain |
-| Remote recording search | blocked on hardware | HTTPS/Digest service discovery works; implement FindRecordings/GetRecordingSearchResults after sanitized authorized-device fixtures |
-| Remote playback | blocked on hardware | Replay XAddr is detected independently but not treated as usable; implement GetReplayUri and GStreamer session after validated responses |
+| Remote recording search | in progress | Probe implements Summary, GetRecordings, FindRecordings, paged results, metadata lookup, and EndSearch; validate operation responses on authorized hardware |
+| Remote playback | in progress | Probe implements GetReplayUri and a GStreamer decode test; no device has yet returned a URI or decoded replay media |
 | Calendar/timeline navigation | not started | depends on normalized recording results |
-| Time-range export | in progress | core contracts exist; remux/transcode job engine remains |
+| Time-range export | blocked on hardware | design documented; requires replay URI and verified timestamp/range behavior before a safe remux proof of concept |
 | MP4 and compatible exports | not started | MP4 remux first; Matroska fallback; test timestamp discontinuities |
 | Automatic reconnection | not started | bounded retry with jitter, session state, and cancellation |
 | H.264/H.265 | blocked on hardware | GStreamer runtime can decode installed plugins; validate per device |

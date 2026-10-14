@@ -82,6 +82,15 @@ device-provided replay URI, then hands media transport to GStreamer. Export is a
 job over an explicit UTC interval. MP4 remux without transcoding is preferred;
 Matroska is a fallback where codec/container constraints require it.
 
+The probe owns a separate read-only recording investigation adapter. It resolves
+the service XAddr from `GetServices`, accepts only HTTP(S) SOAP service URLs on
+the selected device host by default, and refuses HTTPS-to-HTTP downgrade. An
+operator may approve one alternate service host explicitly for unusual ONVIF
+deployments. Search sessions are bounded by a total deadline and page limit,
+and an `EndSearch` cleanup request is attempted after each successfully-created
+search token. The desktop application will consume the same typed results
+rather than interpreting SOAP XML in its UI layer.
+
 ### Vendor extensions
 
 Vendor adapters implement the same core ports. They are optional and should be

@@ -19,6 +19,9 @@ yet been verified against physical hardware.
   WS-Security PasswordDigest for devices that require SOAP authentication.
 - ONVIF service classification for Recording Search, Recording Control, Replay,
   Media, PTZ, and Events.
+- Read-only Recording Search summary, recording configuration inventory,
+  asynchronous recording search, and Replay URI investigation through
+  `device-probe`.
 - RTSP validation through GStreamer. Success requires a decoded media buffer,
   not merely a successful TCP connection.
 
@@ -76,6 +79,10 @@ supplied by the operator.
 cargo run -p device-probe -- inspect --host 192.168.10.50
 cargo run -p device-probe -- capabilities --host 192.168.10.50 --username admin
 cargo run -p device-probe -- inspect --service-url 'https://camera.example/onvif/device_service' --username admin
+cargo run -p device-probe -- recordings summary --service-url 'https://camera.example/onvif/device_service' --username admin
+cargo run -p device-probe -- recordings search --service-url 'https://camera.example/onvif/device_service' --username admin --start '2026-01-01T00:00:00Z' --end '2026-01-02T00:00:00Z'
+cargo run -p device-probe -- recordings replay-uri --service-url 'https://camera.example/onvif/device_service' --username admin --recording-token '<TOKEN>'
+cargo run -p device-probe -- recordings replay-test --service-url 'https://camera.example/onvif/device_service' --username admin --recording-token '<TOKEN>'
 cargo run -p device-probe -- --timeout 20 rtsp-test --url 'rtsp://camera.example/stream'
 ```
 
@@ -86,12 +93,22 @@ with `--keyring`. Never put passwords in command-line URLs or repository files.
 HTTPS certificate verification is enabled by default. `--insecure-tls` is a
 deliberately explicit local-diagnostic escape hatch for a known, authorized
 device with a self-signed certificate; it must never be used as a deployment
-default. It is accepted only for HTTPS ONVIF endpoints.
+default. It is accepted only for HTTPS ONVIF endpoints. Prefer
+`--tls-ca-file /path/to/device-ca.pem` when a device certificate or local CA can
+be trusted explicitly.
 
 An advertised Recording Search, Recording Control, or Replay service is
 reported as **unverified** until its relevant operation has actually succeeded.
-The current probe intentionally does not attempt replay or recording-search
-operations without validated, sanitized fixtures.
+The probe executes only read-only investigation operations when the operator
+explicitly requests a recording command; it does not claim the resulting
+capability is usable until that command succeeds on the selected device.
+
+Recording Search is read-only. The probe bounds polling, uses a ten-second
+ONVIF keep-alive request, and attempts `EndSearch` after a session was created.
+`--start` and `--end` filter recording metadata returned by the device; they do
+not claim frame-accurate video boundaries. See
+[remote-recordings.md](docs/remote-recordings.md) for the compatibility and
+export evidence required before enabling a user-facing export feature.
 
 Exit codes are `0` for success, `2` for invalid input, `4` for authentication,
 `5` for timeouts, `6` for unsupported operations, and `1` for other failures.
