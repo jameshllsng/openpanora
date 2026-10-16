@@ -667,6 +667,47 @@ impl<T: SoapTransport> OnvifClient<T> {
         parse_media_profiles(&response)
     }
 
+    pub async fn stream_uri(&self, profile_token: &str) -> Result<Url, ProbeError> {
+        if profile_token.is_empty()
+            || profile_token.len() > 1024
+            || profile_token.chars().any(char::is_control)
+        {
+            return Err(ProbeError::Input("invalid media profile token".into()));
+        }
+        let services = self.services().await?;
+        let service = services
+            .iter()
+            .find(|service| {
+                service.namespace.contains("/media/wsdl")
+                    || service.namespace.contains("/media2/wsdl")
+            })
+            .ok_or_else(|| {
+                ProbeError::Unsupported("GetServices did not advertise Media or Media2".into())
+            })?;
+        let endpoint = self.validated_service_endpoint(&service.endpoint)?;
+        let prefix = if service.namespace.contains("/media2/") {
+            "tr2"
+        } else {
+            "trt"
+        };
+        let body = format!(
+            "<{prefix}:GetStreamUri xmlns:{prefix}=\"{}\" xmlns:tt=\"http://www.onvif.org/ver10/schema\">\
+             <{prefix}:StreamSetup><tt:Stream>RTP-Unicast</tt:Stream><tt:Transport><tt:Protocol>RTSP</tt:Protocol></tt:Transport></{prefix}:StreamSetup>\
+             <{prefix}:ProfileToken>{}</{prefix}:ProfileToken></{prefix}:GetStreamUri>",
+            escape(&service.namespace),
+            escape(profile_token)
+        );
+        let response = self
+            .call_service(
+                &endpoint,
+                &format!("{}/GetStreamUri", service.namespace),
+                &body,
+            )
+            .await?;
+        let value = parse_stream_uri(&response)?;
+        self.validated_replay_uri(&value)
+    }
+
     pub async fn call_service(
         &self,
         endpoint: &Url,
@@ -805,6 +846,19 @@ fn parse_media_profiles(xml: &str) -> Result<Vec<MediaProfile>, ProbeError> {
         })
         .collect();
     Ok(profiles)
+}
+
+fn parse_stream_uri(xml: &str) -> Result<String, ProbeError> {
+    let document =
+        Document::parse(xml).map_err(|error| ProbeError::Malformed(error.to_string()))?;
+    let response = document
+        .descendants()
+        .find(|node| node.is_element() && node.tag_name().name() == "GetStreamUriResponse")
+        .ok_or_else(|| ProbeError::Malformed("expected GetStreamUriResponse".into()))?;
+    find_text(response, "Uri")
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+        .ok_or_else(|| ProbeError::Malformed("GetStreamUri omitted Uri".into()))
 }
 
 fn sanitize_endpoint(value: &str) -> String {
@@ -1161,5 +1215,15 @@ mod tests {
             Some(std::path::Path::new("/tmp/openpanora-no-such-ca.pem")),
         );
         assert!(matches!(result, Err(ProbeError::Input(_))));
+    }
+
+    #[test]
+    fn parses_and_validates_onvif_stream_uri() {
+        let xml = "<Envelope><Body><GetStreamUriResponse><MediaUri><Uri>rtsp://camera.test/live?opaque=value</Uri></MediaUri></GetStreamUriResponse></Body></Envelope>";
+        assert_eq!(
+            parse_stream_uri(xml).unwrap(),
+            "rtsp://camera.test/live?opaque=value"
+        );
+        assert!(parse_stream_uri("<Envelope/>").is_err());
     }
 }

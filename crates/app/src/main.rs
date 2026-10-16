@@ -1,12 +1,20 @@
 #![allow(deprecated)]
+mod media;
 
 use device_probe::{
     auth::Credentials,
     onvif::{HttpSoapTransport, OnvifClient},
 };
 use gtk::prelude::*;
-use openpanora_core::{CompatibilityReport, Device, DeviceRepository, SqliteDeviceRepository};
-use std::{rc::Rc, sync::mpsc, time::Duration};
+use openpanora_core::{
+    CompatibilityReport, Device, DeviceRepository, MediaProfile, SqliteDeviceRepository,
+};
+use std::{
+    cell::{Cell, RefCell},
+    rc::Rc,
+    sync::mpsc,
+    time::Duration,
+};
 use url::Url;
 
 const APP_ID: &str = "org.openpanora.OpenPanora";
@@ -33,7 +41,7 @@ fn build_ui(app: &gtk::Application) {
         .default_height(760)
         .build();
     let stack = gtk::Stack::builder().hexpand(true).vexpand(true).build();
-    stack.add_titled(&live_view(), Some("live"), "Live View");
+    stack.add_titled(&live_view(repository.clone()), Some("live"), "Live View");
     stack.add_titled(
         &devices_view(repository, &window),
         Some("devices"),
@@ -331,6 +339,15 @@ fn inspect(device: Device, status: gtk::Label) {
 }
 
 fn inspect_blocking(device: Device) -> Result<String, String> {
+    let (client, _) = onvif_client(&device)?;
+    let runtime = tokio::runtime::Runtime::new().map_err(|_| "async runtime unavailable")?;
+    let report = runtime
+        .block_on(client.inspect())
+        .map_err(|error| error.to_string())?;
+    format_verified_inspection(report)
+}
+
+fn onvif_client(device: &Device) -> Result<(OnvifClient<HttpSoapTransport>, Credentials), String> {
     let endpoint = if device.host.starts_with("http://") || device.host.starts_with("https://") {
         Url::parse(&device.host).map_err(|error| error.to_string())?
     } else {
@@ -348,18 +365,20 @@ fn inspect_blocking(device: Device) -> Result<String, String> {
         .map_err(|_| "Secret Service unavailable")?
         .get_password()
         .map_err(|_| "credential unavailable")?;
-    let runtime = tokio::runtime::Runtime::new().map_err(|_| "async runtime unavailable")?;
     let transport = HttpSoapTransport::new(
         Duration::from_secs(10),
-        Some(Credentials { username, password }),
+        Some(Credentials {
+            username: username.clone(),
+            password: password.clone(),
+        }),
         device.insecure_tls,
         device.tls_ca_file.as_deref().map(std::path::Path::new),
     )
     .map_err(|error| error.to_string())?;
-    let report = runtime
-        .block_on(OnvifClient::new(transport, endpoint, None, None).inspect())
-        .map_err(|error| error.to_string())?;
-    format_verified_inspection(report)
+    Ok((
+        OnvifClient::new(transport, endpoint, None, None),
+        Credentials { username, password },
+    ))
 }
 
 fn format_verified_inspection(report: CompatibilityReport) -> Result<String, String> {
@@ -389,16 +408,328 @@ fn format_verified_inspection(report: CompatibilityReport) -> Result<String, Str
     ))
 }
 
-fn live_view() -> gtk::Box {
+fn live_view(repository: Rc<SqliteDeviceRepository>) -> gtk::Box {
     let view = page(
         "Live View",
-        "Choose a discovered channel to prepare a native GStreamer video surface.",
+        "Select a registered device, discover its ONVIF profiles, then explicitly start one live stream.",
     );
-    view.append(&row(
-        "No channel selected",
-        "Live playback is not yet verified in the GTK interface.",
-    ));
+    let devices = gtk::ComboBoxText::new();
+    if let Ok(items) = repository.list() {
+        for device in items {
+            devices.append(Some(&device.id.to_string()), &device.name);
+        }
+    }
+    let profiles = gtk::ListBox::builder()
+        .selection_mode(gtk::SelectionMode::Single)
+        .build();
+    let profiles_scroll = gtk::ScrolledWindow::builder()
+        .child(&profiles)
+        .min_content_height(150)
+        .max_content_height(220)
+        .vexpand(false)
+        .build();
+    let profile_tokens = Rc::new(RefCell::new(Vec::<String>::new()));
+    let discover = gtk::Button::with_label("Discover profiles");
+    let selectors = gtk::Grid::builder()
+        .column_spacing(8)
+        .row_spacing(8)
+        .build();
+    selectors.attach(&gtk::Label::new(Some("Device")), 0, 0, 1, 1);
+    selectors.attach(&devices, 1, 0, 1, 1);
+    selectors.attach(&discover, 2, 0, 1, 1);
+    selectors.attach(&gtk::Label::new(Some("Profile")), 0, 1, 1, 1);
+    selectors.attach(&profiles_scroll, 1, 1, 2, 1);
+    let picture = gtk::Picture::builder()
+        .hexpand(true)
+        .vexpand(true)
+        .height_request(360)
+        .build();
+    let status = gtk::Label::new(Some("Disconnected"));
+    let start = gtk::Button::with_label("Start live view");
+    let retry = gtk::Button::with_label("Retry");
+    let test = gtk::Button::with_label("Test video surface");
+    let stop = gtk::Button::with_label("Stop");
+    let controls = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    controls.append(&start);
+    controls.append(&retry);
+    controls.append(&test);
+    controls.append(&stop);
+    controls.append(&status);
+    let session = Rc::new(RefCell::new(None::<media::LiveSession>));
+    let generation = Rc::new(Cell::new(0_u64));
+    let reconnect_plan = Rc::new(RefCell::new(media::ReconnectPlan::default()));
+    for selector in [
+        devices.clone().upcast::<gtk::Widget>(),
+        profiles.clone().upcast(),
+    ] {
+        let session = session.clone();
+        let generation = generation.clone();
+        let plan = reconnect_plan.clone();
+        let status = status.clone();
+        selector.connect_notify_local(Some("selected"), move |_, _| {
+            generation.set(generation.get().wrapping_add(1));
+            plan.borrow_mut().cancel();
+            if let Some(mut session) = session.borrow_mut().take() {
+                session.stop();
+            }
+            status.set_text("Disconnected");
+        });
+    }
+    let session_start = session.clone();
+    let picture_start = picture.clone();
+    let status_start = status.clone();
+    let generation_test = generation.clone();
+    let reconnect_plan_test = reconnect_plan.clone();
+    test.connect_clicked(move |_| {
+        generation_test.set(generation_test.get().wrapping_add(1));
+        reconnect_plan_test.borrow_mut().cancel();
+        if let Some(mut old) = session_start.borrow_mut().take() {
+            old.stop();
+        }
+        match media::LiveSession::new(&picture_start).and_then(|mut value| {
+            value.start_test_pattern()?;
+            Ok(value)
+        }) {
+            Ok(value) => {
+                *session_start.borrow_mut() = Some(value);
+                status_start.set_text("Synthetic pipeline started");
+            }
+            Err(error) => status_start.set_text(&format!("Error: {error}")),
+        }
+    });
+    let repository_discover = repository.clone();
+    let profiles_discover = profiles.clone();
+    let profile_tokens_discover = profile_tokens.clone();
+    let devices_discover = devices.clone();
+    let status_discover = status.clone();
+    discover.connect_clicked(move |_| {
+        let Some(id) = devices_discover.active_id() else {
+            status_discover.set_text("Select a registered device first");
+            return;
+        };
+        let device = repository_discover
+            .list()
+            .ok()
+            .and_then(|items| items.into_iter().find(|device| device.id.to_string() == id));
+        let Some(device) = device else {
+            status_discover.set_text("The selected device no longer exists");
+            return;
+        };
+        status_discover.set_text("Discovering ONVIF profiles…");
+        let (send, receive) = mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = send.send(live_profiles_blocking(device));
+        });
+        let profiles = profiles_discover.clone();
+        let status = status_discover.clone();
+        let profile_tokens = profile_tokens_discover.clone();
+        gtk::glib::timeout_add_local(Duration::from_millis(100), move || {
+            match receive.try_recv() {
+                Ok(Ok(items)) => {
+                    while let Some(child) = profiles.first_child() {
+                        profiles.remove(&child);
+                    }
+                    profile_tokens.borrow_mut().clear();
+                    for profile in items {
+                        profile_tokens.borrow_mut().push(profile.token);
+                        profiles.append(&row(
+                            profile.name.as_deref().unwrap_or("Unnamed ONVIF profile"),
+                            "ONVIF media profile",
+                        ));
+                    }
+                    status.set_text("Profiles discovered. Select one and start live view.");
+                    gtk::glib::ControlFlow::Break
+                }
+                Ok(Err(error)) => {
+                    status.set_text(&format!("Profile discovery failed: {error}"));
+                    gtk::glib::ControlFlow::Break
+                }
+                Err(mpsc::TryRecvError::Empty) => gtk::glib::ControlFlow::Continue,
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    status.set_text("Profile discovery worker stopped unexpectedly");
+                    gtk::glib::ControlFlow::Break
+                }
+            }
+        });
+    });
+    let repository_start = repository.clone();
+    let devices_start = devices.clone();
+    let profiles_start = profiles.clone();
+    let profile_tokens_start = profile_tokens.clone();
+    let session_live = session.clone();
+    let picture_live = picture.clone();
+    let status_live = status.clone();
+    let generation_live = generation.clone();
+    let reconnect_plan_live = reconnect_plan.clone();
+    start.connect_clicked(move |_| {
+        let Some(id) = devices_start.active_id() else {
+            status_live.set_text("Select a device and an ONVIF profile first");
+            return;
+        };
+        let token = profiles_start.selected_row().and_then(|row| {
+            profile_tokens_start
+                .borrow()
+                .get(row.index() as usize)
+                .cloned()
+        });
+        let Some(token) = token else {
+            status_live.set_text("Select an ONVIF profile first");
+            return;
+        };
+        let device = repository_start
+            .list()
+            .ok()
+            .and_then(|items| items.into_iter().find(|device| device.id.to_string() == id));
+        let Some(device) = device else {
+            status_live.set_text("The selected device no longer exists");
+            return;
+        };
+        status_live.set_text("Requesting a live stream URI…");
+        generation_live.set(generation_live.get().wrapping_add(1));
+        reconnect_plan_live.borrow_mut().cancel();
+        let request_generation = generation_live.get();
+        if let Some(mut old) = session_live.borrow_mut().take() {
+            old.stop();
+        }
+        let (send, receive) = mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = send.send(live_stream_blocking(device, token));
+        });
+        let session = session_live.clone();
+        let picture = picture_live.clone();
+        let status = status_live.clone();
+        let generation = generation_live.clone();
+        gtk::glib::timeout_add_local(Duration::from_millis(100), move || {
+            match receive.try_recv() {
+                Ok(Ok((uri, credentials))) => {
+                    if generation.get() != request_generation {
+                        return gtk::glib::ControlFlow::Break;
+                    }
+                    match media::LiveSession::new(&picture).and_then(|mut value| {
+                        value.start_rtsp(&uri, &credentials)?;
+                        Ok(value)
+                    }) {
+                        Ok(value) => {
+                            *session.borrow_mut() = Some(value);
+                            status.set_text("RTSP pipeline started; waiting for decoded video…");
+                        }
+                        Err(error) => status.set_text(&format!("Live view setup failed: {error}")),
+                    }
+                }
+                Ok(Err(error)) => status.set_text(&format!("Live stream request failed: {error}")),
+                Err(mpsc::TryRecvError::Empty) => return gtk::glib::ControlFlow::Continue,
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    status.set_text("Live stream worker stopped unexpectedly")
+                }
+            }
+            gtk::glib::ControlFlow::Break
+        });
+    });
+    let start_retry = start.clone();
+    retry.connect_clicked(move |_| start_retry.emit_clicked());
+    let session_stop = session.clone();
+    let status_stop = status.clone();
+    let generation_stop = generation.clone();
+    let reconnect_plan_stop = reconnect_plan.clone();
+    stop.connect_clicked(move |_| {
+        generation_stop.set(generation_stop.get().wrapping_add(1));
+        reconnect_plan_stop.borrow_mut().cancel();
+        if let Some(mut value) = session_stop.borrow_mut().take() {
+            value.stop();
+        }
+        status_stop.set_text("Disconnected");
+    });
+    let session_events = session.clone();
+    let status_events = status.clone();
+    let generation_events = generation.clone();
+    let reconnect_plan_events = reconnect_plan.clone();
+    gtk::glib::timeout_add_local(Duration::from_millis(250), move || {
+        if let Some(session) = session_events.borrow_mut().as_mut() {
+            let diagnostics = session.poll();
+            match diagnostics.state {
+                media::LiveState::Connecting => {
+                    status_events.set_text("Connecting to RTSP stream…")
+                }
+                media::LiveState::Buffering => {
+                    status_events.set_text("RTSP connected; buffering video…")
+                }
+                media::LiveState::ReceivingVideo => {
+                    reconnect_plan_events.borrow_mut().recovered();
+                    status_events.set_text("Receiving decoded video")
+                }
+                media::LiveState::Stalled => status_events
+                    .set_text("Video stalled; reconnection will be attempted if retries remain"),
+                media::LiveState::Error => {
+                    status_events.set_text("GStreamer stream, authentication, or decoder error")
+                }
+                media::LiveState::Reconnecting => status_events.set_text("Reconnecting…"),
+                media::LiveState::Disconnected => status_events.set_text("Disconnected"),
+            }
+            let transient_failure = diagnostics.state == media::LiveState::Stalled
+                || (diagnostics.state == media::LiveState::Error
+                    && diagnostics.failure == Some(media::FailureKind::Transient));
+            if let Some((attempt, delay)) = reconnect_plan_events
+                .borrow_mut()
+                .schedule(transient_failure)
+            {
+                session.mark_reconnecting();
+                status_events.set_text(&format!(
+                    "Reconnecting ({attempt}/{})…",
+                    media::MAX_AUTOMATIC_RECONNECTS
+                ));
+                let expected_generation = generation_events.get();
+                let session = session_events.clone();
+                let status = status_events.clone();
+                let generation = generation_events.clone();
+                let plan = reconnect_plan_events.clone();
+                gtk::glib::timeout_add_local_once(delay, move || {
+                    if generation.get() != expected_generation {
+                        return;
+                    }
+                    plan.borrow_mut().retry_fired();
+                    if let Some(session) = session.borrow_mut().as_mut() {
+                        if session.reconnect().is_err() {
+                            status.set_text("Automatic reconnect could not start");
+                        } else {
+                            status.set_text("Reconnecting to RTSP stream…");
+                        }
+                    }
+                });
+            } else if transient_failure && !reconnect_plan_events.borrow().pending() {
+                status_events.set_text("Video stalled; automatic reconnect limit reached");
+            }
+        }
+        gtk::glib::ControlFlow::Continue
+    });
+    view.append(&selectors);
+    view.append(&picture);
+    view.append(&controls);
+    view.append(&row("Security", "The stream URI and credentials stay in process memory only and are never displayed or logged."));
     view
+}
+
+fn live_profiles_blocking(device: Device) -> Result<Vec<MediaProfile>, String> {
+    let (client, _) = onvif_client(&device)?;
+    let runtime = tokio::runtime::Runtime::new().map_err(|_| "async runtime unavailable")?;
+    let report = runtime
+        .block_on(client.inspect())
+        .map_err(|error| error.to_string())?;
+    if report.media_profiles.is_empty() {
+        return Err("the device returned no ONVIF media profiles".into());
+    }
+    Ok(report.media_profiles)
+}
+
+fn live_stream_blocking(
+    device: Device,
+    profile_token: String,
+) -> Result<(Url, Credentials), String> {
+    let (client, credentials) = onvif_client(&device)?;
+    let runtime = tokio::runtime::Runtime::new().map_err(|_| "async runtime unavailable")?;
+    let uri = runtime
+        .block_on(client.stream_uri(&profile_token))
+        .map_err(|error| error.to_string())?;
+    Ok((uri, credentials))
 }
 fn recordings_view() -> gtk::Box {
     let view = page(

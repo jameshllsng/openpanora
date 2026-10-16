@@ -12,7 +12,9 @@ yet been verified against physical hardware.
 Launch the GTK4 application with `cargo run -p openpanora`. The Devices
 workspace persists explicit ONVIF service URLs in SQLite, stores passwords only
 in Linux Secret Service, and performs a read-only shared ONVIF inspection on a
-worker thread. Live video, replay, and export remain unverified.
+worker thread. Live View can discover ONVIF profiles, request a device-supplied
+live RTSP URI, and render it in GTK with GStreamer. Physical-device playback,
+replay, and export remain unverified.
 
 ## Current functionality
 
@@ -31,6 +33,8 @@ worker thread. Live video, replay, and export remain unverified.
   `device-probe`.
 - RTSP validation through GStreamer. Success requires a decoded media buffer,
   not merely a successful TCP connection.
+- A GTK4 embedded live-view session using `gtk4paintablesink`, with explicit
+  device/profile selection, start, stop, retry, and safe error reporting.
 
 ## Version 1.0 goals
 
@@ -56,6 +60,19 @@ sudo apt install -y build-essential pkg-config libgtk-4-dev \
   gstreamer1.0-plugins-bad gstreamer1.0-libav
 ```
 
+OpenPanora requires the Rust `gst-plugin-gtk4` element for embedded video. For
+the locally-built plugin used by this development environment:
+
+```bash
+export GST_PLUGIN_PATH="$HOME/.local/lib/gstreamer-1.0${GST_PLUGIN_PATH:+:$GST_PLUGIN_PATH}"
+gst-inspect-1.0 gtk4paintablesink
+```
+
+The last command must report `GTK 4 Paintable Sink`. The implementation works
+with the system-memory sink; it does not require GL zero-copy support. Install
+H.264/H.265 decoder plugins appropriate to the deployment before expecting a
+camera stream to decode.
+
 Install the stable Rust toolchain using rustup. The workspace uses Rust 2024
 edition and requires Rust 1.85 or newer.
 
@@ -71,8 +88,20 @@ cargo test --workspace
 ## Run the desktop application
 
 ```bash
-cargo run -p openpanora
+GST_PLUGIN_PATH="$HOME/.local/lib/gstreamer-1.0${GST_PLUGIN_PATH:+:$GST_PLUGIN_PATH}" cargo run -p openpanora
 ```
+
+In **Live View**, select a registered device, click **Discover profiles**, choose
+a profile, and click **Start live view**. The app retrieves `GetStreamUri` only
+after that explicit action. It preserves the device-supplied path/query in
+memory, supplies Secret-Service credentials to GStreamer without displaying
+them, and sends RTSP over TCP. **Test video surface** is a local synthetic
+source for validating GTK/GStreamer wiring; it is not camera playback.
+
+Live sessions reconnect only for bounded transient failures: up to three
+attempts after 1, 2, and 4 seconds. Selecting another device/profile, starting
+a new session, or pressing Stop cancels any scheduled retry. Authentication and
+decoder/configuration errors are not retried automatically.
 
 WSL2 requires WSLg or another functioning Wayland/X11 display. Compilation and
 unit tests do not prove that the GUI can open on a particular WSL installation.
