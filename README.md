@@ -7,6 +7,13 @@ RTSP/RTP interfaces and keeps vendor integrations optional and isolated.
 The project is in its initial development sprint. Device compatibility has not
 yet been verified against physical hardware.
 
+## Desktop application
+
+Launch the GTK4 application with `cargo run -p openpanora`. The Devices
+workspace persists explicit ONVIF service URLs in SQLite, stores passwords only
+in Linux Secret Service, and performs a read-only shared ONVIF inspection on a
+worker thread. Live video, replay, and export remain unverified.
+
 ## Current functionality
 
 - A launchable GTK4 desktop shell with Devices, Live View, Recordings, and
