@@ -36,3 +36,20 @@ Native packages are available on Ubuntu 24.04 under WSL2. GUI execution requires
 WSLg or a configured Wayland/X server. GStreamer RTSP testing additionally needs
 the relevant demuxer and codec plugin packages. Build success alone is not a GUI
 or codec runtime test.
+
+## Embedded live video
+
+Live View requires GStreamer's `gtk4paintablesink`. When `gst-plugin-gtk4` is
+built under a user prefix, make it visible before starting the app:
+
+```bash
+export GST_PLUGIN_PATH="$HOME/.local/lib/gstreamer-1.0${GST_PLUGIN_PATH:+:$GST_PLUGIN_PATH}"
+gst-inspect-1.0 gtk4paintablesink
+cargo run -p openpanora
+```
+
+The GTK application owns media pipelines on its main thread; ONVIF and Secret
+Service work happens on worker threads. A synthetic `videotestsrc` path covers
+the local pipeline assembly test. It does not validate WSLg rendering, RTSP
+authentication, H.264/H.265 decoding, or any physical camera. Start real
+streams only through an explicit operator action against an authorized device.

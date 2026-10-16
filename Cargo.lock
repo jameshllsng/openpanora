@@ -1264,6 +1264,7 @@ name = "openpanora"
 version = "0.1.0"
 dependencies = [
  "device-probe",
+ "gstreamer",
  "gtk4",
  "keyring",
  "openpanora-core",
