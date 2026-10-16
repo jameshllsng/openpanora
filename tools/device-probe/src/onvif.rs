@@ -12,7 +12,7 @@ use rand::RngCore;
 use reqwest::{StatusCode, header};
 use roxmltree::{Document, Node};
 use sha1::{Digest, Sha1};
-use std::{collections::HashSet, fmt::Write, path::Path, time::Duration};
+use std::{collections::HashSet, error::Error as StdError, fmt::Write, path::Path, time::Duration};
 use thiserror::Error;
 use url::Url;
 
@@ -151,6 +151,10 @@ impl SoapTransport for HttpSoapTransport {
                 return Err(ProbeError::HttpUnauthorized);
             };
             let challenge = digest_challenge(response.headers())?;
+            // Consume the challenge response before retrying. Some cameras keep the TCP
+            // connection alive and reject a follow-up request if its previous response body
+            // was not read completely.
+            let _ = response.bytes().await.map_err(classify_reqwest_error)?;
             let authorization = digest_authorization(credentials, endpoint, &challenge, "POST", 1)?;
             let retry = self
                 .send(endpoint, action, envelope, Some(authorization))
@@ -165,8 +169,34 @@ fn classify_reqwest_error(error: reqwest::Error) -> ProbeError {
     if error.is_timeout() {
         ProbeError::Timeout
     } else {
-        classify_transport_message(&error.to_string())
+        let detail = safe_transport_detail(&error);
+        let classified = classify_transport_message(&detail);
+        match classified {
+            ProbeError::Transport(_) if error.is_connect() => {
+                ProbeError::Transport(format!("connection failed: {detail}"))
+            }
+            ProbeError::Transport(_) if error.is_request() => {
+                ProbeError::Transport(format!("request failed: {detail}"))
+            }
+            ProbeError::Transport(_) if error.is_body() => {
+                ProbeError::Transport(format!("response body transfer failed: {detail}"))
+            }
+            other => other,
+        }
     }
+}
+
+fn safe_transport_detail(error: &reqwest::Error) -> String {
+    let mut source = error.source();
+    let mut detail = None;
+    while let Some(cause) = source {
+        detail = Some(cause.to_string());
+        source = cause.source();
+    }
+    let detail = detail.unwrap_or_else(|| "request could not be sent".into());
+    // A source-chain detail is intentionally used instead of reqwest's display string,
+    // which can include a full URL. Bound it so a peer cannot cause oversized diagnostics.
+    detail.chars().take(240).collect()
 }
 
 fn classify_transport_message(message: &str) -> ProbeError {
@@ -1056,7 +1086,7 @@ mod tests {
                     .contains("POST /onvif")
             );
             first
-                .write_all(b"HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Digest realm=\"camera\", nonce=\"nonce\", qop=\"auth\"\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                .write_all(b"HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Digest realm=\"camera\", nonce=\"nonce\", qop=\"auth\"\r\nContent-Length: 9\r\nConnection: close\r\n\r\nchallenge")
                 .await
                 .unwrap();
 

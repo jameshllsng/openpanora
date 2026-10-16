@@ -81,7 +81,7 @@ impl<'a, T: SoapTransport> RecordingClient<'a, T> {
                 &endpoint,
                 SEARCH_NS,
                 "GetRecordingSummary",
-                "<tse:GetRecordingSummary/>",
+                &format!("<tse:GetRecordingSummary xmlns:tse=\"{SEARCH_NS}\"/>"),
             )
             .await?;
         parse_summary(&response)
@@ -94,7 +94,7 @@ impl<'a, T: SoapTransport> RecordingClient<'a, T> {
                 &endpoint,
                 RECORDING_NS,
                 "GetRecordings",
-                "<trc:GetRecordings/>",
+                &format!("<trc:GetRecordings xmlns:trc=\"{RECORDING_NS}\"/>"),
             )
             .await?;
         parse_recording_items(&response)
@@ -204,7 +204,7 @@ impl<'a, T: SoapTransport> RecordingClient<'a, T> {
                 &endpoint,
                 REPLAY_NS,
                 "GetReplayConfiguration",
-                "<trp:GetReplayConfiguration/>",
+                &format!("<trp:GetReplayConfiguration xmlns:trp=\"{REPLAY_NS}\"/>"),
             )
             .await?;
         parse_replay_configuration(&response)
@@ -473,10 +473,15 @@ fn require_token(value: &str, label: &str) -> Result<(), ProbeError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::onvif::HttpSoapTransport;
     use async_trait::async_trait;
     use std::{
         collections::VecDeque,
         sync::{Arc, Mutex},
+    };
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::TcpListener,
     };
 
     const SUMMARY: &str = r#"<Envelope><Body><GetRecordingSummaryResponse><Summary><DataFrom>2025-01-01T00:00:00Z</DataFrom><DataUntil>2025-01-02T00:00:00Z</DataUntil><NumberRecordings>2</NumberRecordings></Summary></GetRecordingSummaryResponse></Body></Envelope>"#;
@@ -647,5 +652,54 @@ mod tests {
                 .validated_replay_uri("rtsp://operator:secret@camera.test/replay")
                 .is_err()
         );
+    }
+
+    #[tokio::test]
+    async fn summary_declares_the_search_namespace_on_the_wire() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let services = format!(
+            "<Envelope><Body><GetServicesResponse><Service><Namespace>{SEARCH_NS}</Namespace><XAddr>http://{address}/onvif/search_service</XAddr></Service></GetServicesResponse></Body></Envelope>"
+        );
+        let server = tokio::spawn(async move {
+            let (mut device, _) = listener.accept().await.unwrap();
+            let request = read_request(&mut device).await;
+            assert!(request.contains("GetServices"));
+            write_response(&mut device, &services).await;
+
+            let (mut search, _) = listener.accept().await.unwrap();
+            let request = read_request(&mut search).await;
+            assert!(request.contains("<tse:GetRecordingSummary"));
+            assert!(request.contains(&format!("xmlns:tse=\"{SEARCH_NS}\"")));
+            write_response(&mut search, SUMMARY).await;
+        });
+
+        let transport = HttpSoapTransport::new(Duration::from_secs(2), None, false, None).unwrap();
+        let client = OnvifClient::new(
+            transport,
+            Url::parse(&format!("http://{address}/onvif/device_service")).unwrap(),
+            None,
+            None,
+        );
+        let summary = RecordingClient::new(&client, Duration::from_secs(2))
+            .summary()
+            .await
+            .unwrap();
+        assert_eq!(summary.number_of_recordings, 2);
+        server.await.unwrap();
+    }
+
+    async fn read_request(stream: &mut tokio::net::TcpStream) -> String {
+        let mut buffer = vec![0_u8; 8192];
+        let bytes = stream.read(&mut buffer).await.unwrap();
+        String::from_utf8_lossy(&buffer[..bytes]).into_owned()
+    }
+
+    async fn write_response(stream: &mut tokio::net::TcpStream, body: &str) {
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/soap+xml\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        stream.write_all(response.as_bytes()).await.unwrap();
     }
 }
