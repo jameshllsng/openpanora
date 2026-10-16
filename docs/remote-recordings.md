@@ -24,6 +24,12 @@ time-range argument, so OpenPanora filters its discovered recording metadata by
 interval. A missing `EarliestRecording` or `LatestRecording` is never treated
 as a positive time-range match.
 
+Searches use `MinResults=1`, bounded `WaitTime`, bounded inter-poll delay, and
+a separately bounded session `KeepAliveTime`. `GetRecordingSearchResults` is
+allowed to report `Searching`; it is not a failure by itself. If the poll limit
+or total search budget is reached, the probe reports the final observed state
+and still makes one bounded `EndSearch` cleanup attempt.
+
 `replay-uri` sends `GetReplayUri` requesting unicast RTP over RTSP. A returned
 URI is accepted only when it is RTSP/RTSPS, credential-free, and hosted by the
 selected device or an explicitly approved alternate service host. `replay-test`

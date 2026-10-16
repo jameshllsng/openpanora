@@ -514,7 +514,10 @@ fn rtsp_status_error(operation: &str, status: u16) -> ProbeError {
         405 | 461 => ProbeError::Unsupported(format!(
             "RTSP {operation} was rejected with status {status}"
         )),
-        _ => ProbeError::Transport(format!("RTSP {operation} returned status {status}")),
+        _ => ProbeError::RtspServerResponse {
+            operation: operation.to_owned(),
+            status,
+        },
     }
 }
 
@@ -819,6 +822,15 @@ mod tests {
             ProbeError::OperationTimeout { operation, .. } if operation == "RTSP replay RTSP OPTIONS"
         ));
         server.join().unwrap();
+    }
+
+    #[test]
+    fn classifies_rtsp_503_as_a_server_response() {
+        assert!(matches!(
+            rtsp_status_error("DESCRIBE", 503),
+            ProbeError::RtspServerResponse { operation, status }
+                if operation == "DESCRIBE" && status == 503
+        ));
     }
 
     fn read_request(stream: &mut TcpStream) -> String {

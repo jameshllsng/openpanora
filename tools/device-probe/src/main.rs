@@ -8,7 +8,7 @@ mod rtsp;
 use clap::Parser;
 use cli::{Cli, Command, RecordingsCommand};
 use onvif::{HttpSoapTransport, OnvifClient, ProbeError};
-use std::process::ExitCode;
+use std::{process::ExitCode, time::Duration};
 
 #[tokio::main]
 async fn main() -> ExitCode {
@@ -45,10 +45,14 @@ async fn run(cli: Cli) -> Result<(), ProbeError> {
             output::print_report(&report, json)?;
         }
         Command::Recordings(args) => {
+            let operation_timeout = match &args.command {
+                RecordingsCommand::Search(search) => Duration::from_secs(search.search_timeout),
+                _ => timeout,
+            };
             let credentials = credentials::load(&args.device)?;
             let endpoint = args.device.device_service_url()?;
             let transport = HttpSoapTransport::new(
-                timeout,
+                timeout.max(operation_timeout),
                 credentials.clone(),
                 args.device.insecure_tls,
                 args.device.tls_ca_file.as_deref(),
@@ -59,7 +63,7 @@ async fn run(cli: Cli) -> Result<(), ProbeError> {
                 credentials.clone(),
                 args.device.allowed_service_host()?,
             );
-            let recordings = recordings::RecordingClient::new(&client, timeout);
+            let recordings = recordings::RecordingClient::new(&client, operation_timeout);
             match args.command {
                 RecordingsCommand::Summary => {
                     output::print_recording_summary(&recordings.summary().await?, json)?;
@@ -69,7 +73,19 @@ async fn run(cli: Cli) -> Result<(), ProbeError> {
                 }
                 RecordingsCommand::Search(args) => {
                     output::print_recording_search(
-                        &recordings.search(args.start, args.end, args.limit).await?,
+                        &recordings
+                            .search_with_options(
+                                args.start,
+                                args.end,
+                                args.limit,
+                                recordings::SearchOptions {
+                                    max_polls: usize::from(args.max_polls),
+                                    wait_time: Duration::from_secs(args.poll_wait_seconds),
+                                    poll_interval: Duration::from_millis(args.poll_interval_ms),
+                                    keep_alive: Duration::from_secs(args.search_keep_alive_seconds),
+                                },
+                            )
+                            .await?,
                         json,
                     )?;
                 }

@@ -46,6 +46,8 @@ pub enum ProbeError {
     Malformed(String),
     #[error("network transport failed: {0}")]
     Transport(String),
+    #[error("RTSP server rejected {operation} with status {status}")]
+    RtspServerResponse { operation: String, status: u16 },
     #[error("credential access failed: {0}")]
     Credential(String),
     #[error("GStreamer validation failed: {0}")]

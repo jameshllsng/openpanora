@@ -94,6 +94,13 @@ pub fn print_recording_search(
             report.interval_filter_applied
         );
         println!("Recording matches: {}", report.recordings.len());
+        println!(
+            "  Polls: {} (last state: {}; wait: {} ms; interval: {} ms)",
+            report.polls_attempted,
+            report.last_search_state,
+            report.poll_wait_ms,
+            report.poll_interval_ms
+        );
         for recording in &report.recordings {
             print_recording(recording);
         }

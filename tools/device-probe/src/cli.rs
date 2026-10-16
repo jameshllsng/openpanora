@@ -78,6 +78,26 @@ pub struct RecordingSearchArgs {
     /// Upper bound for recordings returned and metadata requests.
     #[arg(long, default_value_t = 32, value_parser = clap::value_parser!(u32).range(1..=128))]
     pub limit: u32,
+
+    /// Total bounded budget for the asynchronous search lifecycle in seconds.
+    #[arg(long, default_value_t = 30, value_parser = clap::value_parser!(u64).range(2..=300))]
+    pub search_timeout: u64,
+
+    /// Maximum GetRecordingSearchResults polls before reporting an incomplete search.
+    #[arg(long, default_value_t = 12, value_parser = clap::value_parser!(u16).range(1..=60))]
+    pub max_polls: u16,
+
+    /// ONVIF WaitTime sent with each GetRecordingSearchResults request, in seconds.
+    #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u64).range(1..=10))]
+    pub poll_wait_seconds: u64,
+
+    /// Delay between incomplete search-result polls, in milliseconds.
+    #[arg(long, default_value_t = 250, value_parser = clap::value_parser!(u64).range(0..=5000))]
+    pub poll_interval_ms: u64,
+
+    /// ONVIF KeepAliveTime requested for the temporary recording-search session, in seconds.
+    #[arg(long, default_value_t = 45, value_parser = clap::value_parser!(u64).range(5..=300))]
+    pub search_keep_alive_seconds: u64,
 }
 
 #[derive(Debug, Args)]

@@ -104,7 +104,10 @@ explicitly requests a recording command; it does not claim the resulting
 capability is usable until that command succeeds on the selected device.
 
 Recording Search is read-only. The probe bounds polling, uses a ten-second
-ONVIF keep-alive request, and attempts `EndSearch` after a session was created.
+ONVIF result wait by default, requests a 45-second temporary search-session
+keep-alive, and attempts `EndSearch` after a session was created. Search budget,
+poll count, wait time, poll interval, and keep-alive are explicit bounded CLI
+options; use `recordings search --help` to inspect them.
 `--start` and `--end` filter recording metadata returned by the device; they do
 not claim frame-accurate video boundaries. See
 [remote-recordings.md](docs/remote-recordings.md) for compatibility and export

@@ -17,6 +17,25 @@ const SCHEMA_NS: &str = "http://www.onvif.org/ver10/schema";
 const MAX_SEARCH_PAGES: usize = 8;
 const PAGE_SIZE: u32 = 16;
 
+#[derive(Debug, Clone, Copy)]
+pub struct SearchOptions {
+    pub max_polls: usize,
+    pub wait_time: Duration,
+    pub poll_interval: Duration,
+    pub keep_alive: Duration,
+}
+
+impl Default for SearchOptions {
+    fn default() -> Self {
+        Self {
+            max_polls: MAX_SEARCH_PAGES,
+            wait_time: Duration::from_secs(1),
+            poll_interval: Duration::from_millis(250),
+            keep_alive: Duration::from_secs(45),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct RecordingSummary {
     pub data_from: Option<DateTime<Utc>>,
@@ -37,6 +56,10 @@ pub struct RecordingSearchReport {
     pub recordings: Vec<RecordingInfo>,
     pub complete: bool,
     pub interval_filter_applied: bool,
+    pub polls_attempted: usize,
+    pub last_search_state: String,
+    pub poll_wait_ms: u128,
+    pub poll_interval_ms: u128,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -103,17 +126,30 @@ impl<'a, T: SoapTransport> RecordingClient<'a, T> {
         parse_recording_items(&response)
     }
 
+    #[cfg(test)]
     pub async fn search(
         &self,
         start: Option<DateTime<Utc>>,
         end: Option<DateTime<Utc>>,
         limit: u32,
     ) -> Result<RecordingSearchReport, ProbeError> {
-        let cancellation = AtomicBool::new(false);
-        self.search_with_cancellation(start, end, limit, &cancellation)
+        self.search_with_options(start, end, limit, SearchOptions::default())
             .await
     }
 
+    pub async fn search_with_options(
+        &self,
+        start: Option<DateTime<Utc>>,
+        end: Option<DateTime<Utc>>,
+        limit: u32,
+        options: SearchOptions,
+    ) -> Result<RecordingSearchReport, ProbeError> {
+        let cancellation = AtomicBool::new(false);
+        self.search_with_options_and_cancellation(start, end, limit, options, &cancellation)
+            .await
+    }
+
+    #[cfg(test)]
     pub async fn search_with_cancellation(
         &self,
         start: Option<DateTime<Utc>>,
@@ -121,7 +157,30 @@ impl<'a, T: SoapTransport> RecordingClient<'a, T> {
         limit: u32,
         cancellation: &AtomicBool,
     ) -> Result<RecordingSearchReport, ProbeError> {
+        self.search_with_options_and_cancellation(
+            start,
+            end,
+            limit,
+            SearchOptions::default(),
+            cancellation,
+        )
+        .await
+    }
+
+    async fn search_with_options_and_cancellation(
+        &self,
+        start: Option<DateTime<Utc>>,
+        end: Option<DateTime<Utc>>,
+        limit: u32,
+        options: SearchOptions,
+        cancellation: &AtomicBool,
+    ) -> Result<RecordingSearchReport, ProbeError> {
         self.ensure_before_deadline(cancellation)?;
+        if options.max_polls == 0 || options.wait_time.is_zero() {
+            return Err(ProbeError::Input(
+                "recording search polling bounds must be positive".into(),
+            ));
+        }
         if let (Some(start), Some(end)) = (start, end)
             && end <= start
         {
@@ -130,24 +189,20 @@ impl<'a, T: SoapTransport> RecordingClient<'a, T> {
             ));
         }
         let endpoint = self.search_endpoint().await?;
-        let find_body = format!(
-            "<tse:FindRecordings xmlns:tse=\"{SEARCH_NS}\"><tse:Scope/>\
-             <tse:MaxMatches>{limit}</tse:MaxMatches><tse:KeepAliveTime>PT10S</tse:KeepAliveTime>\
-             </tse:FindRecordings>"
-        );
+        let find_body = find_recordings_body(limit, options);
         let response = self
             .call(&endpoint, SEARCH_NS, "FindRecordings", &find_body)
             .await?;
         let token = parse_search_token(&response)?;
 
         let result = self
-            .collect_search_results(&endpoint, &token, cancellation)
+            .collect_search_results(&endpoint, &token, options, cancellation)
             .await;
         // EndSearch is always attempted once FindRecordings created a session. A completed
         // search may correctly reject it as an already-invalid token, so cleanup cannot hide
         // a successful result.
         let cleanup = self.end_search(&endpoint, &token).await;
-        let mut recordings = result?;
+        let mut result = result?;
         if let Err(error) = cleanup
             && !matches!(error, ProbeError::Unsupported(_))
         {
@@ -157,7 +212,7 @@ impl<'a, T: SoapTransport> RecordingClient<'a, T> {
         }
 
         let mut unique = BTreeMap::new();
-        for recording in recordings.drain(..) {
+        for recording in result.recordings.drain(..) {
             unique.insert(recording.token.clone(), recording);
         }
         let mut recordings: Vec<_> = unique.into_values().collect();
@@ -178,6 +233,10 @@ impl<'a, T: SoapTransport> RecordingClient<'a, T> {
             recordings,
             complete: true,
             interval_filter_applied: start.is_some() || end.is_some(),
+            polls_attempted: result.polls_attempted,
+            last_search_state: result.last_search_state,
+            poll_wait_ms: options.wait_time.as_millis(),
+            poll_interval_ms: options.poll_interval.as_millis(),
         })
     }
 
@@ -217,29 +276,36 @@ impl<'a, T: SoapTransport> RecordingClient<'a, T> {
         &self,
         endpoint: &Url,
         token: &str,
+        options: SearchOptions,
         cancellation: &AtomicBool,
-    ) -> Result<Vec<RecordingInfo>, ProbeError> {
+    ) -> Result<SearchCollection, ProbeError> {
         let mut recordings = Vec::new();
-        for _ in 0..MAX_SEARCH_PAGES {
+        let mut last_state = "not queried".to_owned();
+        for poll in 0..options.max_polls {
             self.ensure_before_deadline(cancellation)?;
-            let body = format!(
-                "<tse:GetRecordingSearchResults xmlns:tse=\"{SEARCH_NS}\">\
-                 <tse:SearchToken>{}</tse:SearchToken><tse:MinResults>0</tse:MinResults>\
-                 <tse:MaxResults>{PAGE_SIZE}</tse:MaxResults><tse:WaitTime>PT1S</tse:WaitTime>\
-                 </tse:GetRecordingSearchResults>",
-                escape(token)
-            );
+            let body = search_results_body(token, options);
             let response = self
                 .call(endpoint, SEARCH_NS, "GetRecordingSearchResults", &body)
                 .await?;
             let page = parse_search_results(&response)?;
+            last_state = page.state.clone();
             recordings.extend(page.recordings);
             if page.completed {
-                return Ok(recordings);
+                return Ok(SearchCollection {
+                    recordings,
+                    polls_attempted: poll + 1,
+                    last_search_state: last_state,
+                });
+            }
+            if !options.poll_interval.is_zero() {
+                tokio::time::sleep(options.poll_interval).await;
             }
         }
         Err(ProbeError::OperationTimeout {
-            operation: "ONVIF GetRecordingSearchResults (bounded polling)".into(),
+            operation: format!(
+                "ONVIF GetRecordingSearchResults (poll limit {} reached; state={last_state})",
+                options.max_polls
+            ),
             elapsed_ms: self.deadline_elapsed_ms(),
         })
     }
@@ -266,7 +332,13 @@ impl<'a, T: SoapTransport> RecordingClient<'a, T> {
              </tse:EndSearch>",
             escape(token)
         );
-        self.call(endpoint, SEARCH_NS, "EndSearch", &body).await?;
+        // Cleanup remains bounded by the transport request timeout, but is attempted even if
+        // the search's total deadline expired while a server held a poll request open.
+        let started = Instant::now();
+        self.client
+            .call_service(endpoint, &format!("{SEARCH_NS}/EndSearch"), &body)
+            .await
+            .map_err(|error| self.operation_error("ONVIF EndSearch", started, error))?;
         Ok(())
     }
 
@@ -284,10 +356,13 @@ impl<'a, T: SoapTransport> RecordingClient<'a, T> {
 
     async fn service_endpoint(&self, needle: &str) -> Result<Url, ProbeError> {
         let started = Instant::now();
-        let services = self
-            .client
-            .services()
+        let remaining = self.remaining(&AtomicBool::new(false))?;
+        let services = tokio::time::timeout(remaining, self.client.services())
             .await
+            .map_err(|_| ProbeError::OperationTimeout {
+                operation: "ONVIF GetServices".into(),
+                elapsed_ms: started.elapsed().as_millis(),
+            })?
             .map_err(|error| self.operation_error("ONVIF GetServices", started, error))?;
         let service = services
             .iter()
@@ -305,12 +380,19 @@ impl<'a, T: SoapTransport> RecordingClient<'a, T> {
         operation: &str,
         body: &str,
     ) -> Result<String, ProbeError> {
-        self.ensure_before_deadline(&AtomicBool::new(false))?;
+        let remaining = self.remaining(&AtomicBool::new(false))?;
         let started = Instant::now();
-        self.client
-            .call_service(endpoint, &format!("{namespace}/{operation}"), body)
-            .await
-            .map_err(|error| self.operation_error(&format!("ONVIF {operation}"), started, error))
+        tokio::time::timeout(
+            remaining,
+            self.client
+                .call_service(endpoint, &format!("{namespace}/{operation}"), body),
+        )
+        .await
+        .map_err(|_| ProbeError::OperationTimeout {
+            operation: format!("ONVIF {operation}"),
+            elapsed_ms: started.elapsed().as_millis(),
+        })?
+        .map_err(|error| self.operation_error(&format!("ONVIF {operation}"), started, error))
     }
 
     fn operation_error(&self, operation: &str, started: Instant, error: ProbeError) -> ProbeError {
@@ -328,20 +410,50 @@ impl<'a, T: SoapTransport> RecordingClient<'a, T> {
     }
 
     fn ensure_before_deadline(&self, cancellation: &AtomicBool) -> Result<(), ProbeError> {
+        self.remaining(cancellation).map(|_| ())
+    }
+
+    fn remaining(&self, cancellation: &AtomicBool) -> Result<Duration, ProbeError> {
         if cancellation.load(Ordering::Acquire) {
             return Err(ProbeError::Cancelled);
         }
-        if Instant::now() >= self.deadline {
-            Err(ProbeError::Timeout)
-        } else {
-            Ok(())
-        }
+        self.deadline
+            .checked_duration_since(Instant::now())
+            .filter(|remaining| !remaining.is_zero())
+            .ok_or(ProbeError::Timeout)
     }
+}
+
+fn find_recordings_body(limit: u32, options: SearchOptions) -> String {
+    format!(
+        "<tse:FindRecordings xmlns:tse=\"{SEARCH_NS}\"><tse:Scope/>\
+         <tse:MaxMatches>{limit}</tse:MaxMatches><tse:KeepAliveTime>PT{}S</tse:KeepAliveTime>\
+         </tse:FindRecordings>",
+        options.keep_alive.as_secs()
+    )
+}
+
+fn search_results_body(token: &str, options: SearchOptions) -> String {
+    format!(
+        "<tse:GetRecordingSearchResults xmlns:tse=\"{SEARCH_NS}\">\
+         <tse:SearchToken>{}</tse:SearchToken><tse:MinResults>1</tse:MinResults>\
+         <tse:MaxResults>{PAGE_SIZE}</tse:MaxResults><tse:WaitTime>PT{}S</tse:WaitTime>\
+         </tse:GetRecordingSearchResults>",
+        escape(token),
+        options.wait_time.as_secs()
+    )
 }
 
 struct SearchResultsPage {
     recordings: Vec<RecordingInfo>,
     completed: bool,
+    state: String,
+}
+
+struct SearchCollection {
+    recordings: Vec<RecordingInfo>,
+    polls_attempted: usize,
+    last_search_state: String,
 }
 
 fn parse_summary(xml: &str) -> Result<RecordingSummary, ProbeError> {
@@ -397,9 +509,15 @@ fn parse_search_results(xml: &str) -> Result<SearchResultsPage, ProbeError> {
         .filter(|node| node.is_element() && node.tag_name().name() == "RecordingInformation")
         .map(recording_info_from_node)
         .collect::<Result<_, _>>()?;
+    if !matches!(state, "Completed" | "Searching") {
+        return Err(ProbeError::Malformed(format!(
+            "unrecognized ONVIF Recording Search state: {state}"
+        )));
+    }
     Ok(SearchResultsPage {
         recordings,
         completed: state.eq_ignore_ascii_case("Completed"),
+        state: state.to_owned(),
     })
 }
 
@@ -530,6 +648,24 @@ mod tests {
         assert!(page.completed);
         assert_eq!(page.recordings[0].token, "recording-1");
         assert_eq!(page.recordings[0].track_count, 2);
+    }
+
+    #[test]
+    fn uses_bounded_standard_search_parameters() {
+        let options = SearchOptions {
+            max_polls: 3,
+            wait_time: Duration::from_secs(2),
+            poll_interval: Duration::from_millis(50),
+            keep_alive: Duration::from_secs(45),
+        };
+        let find = find_recordings_body(7, options);
+        assert!(find.contains("<tse:Scope/>"));
+        assert!(find.contains("<tse:MaxMatches>7</tse:MaxMatches>"));
+        assert!(find.contains("<tse:KeepAliveTime>PT45S</tse:KeepAliveTime>"));
+        let poll = search_results_body("job-1", options);
+        assert!(poll.contains("<tse:MinResults>1</tse:MinResults>"));
+        assert!(poll.contains("<tse:MaxResults>16</tse:MaxResults>"));
+        assert!(poll.contains("<tse:WaitTime>PT2S</tse:WaitTime>"));
     }
 
     #[test]
@@ -688,6 +824,80 @@ mod tests {
             error,
             ProbeError::OperationTimeout { operation, .. } if operation == "ONVIF FindRecordings"
         ));
+    }
+
+    struct DelayedTransport;
+
+    #[async_trait]
+    impl SoapTransport for DelayedTransport {
+        async fn post(
+            &self,
+            _endpoint: &Url,
+            _action: &str,
+            _envelope: String,
+        ) -> Result<String, ProbeError> {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            Ok(SERVICES.into())
+        }
+    }
+
+    #[tokio::test]
+    async fn total_search_budget_caps_a_stalled_get_services_call() {
+        let client = OnvifClient::new(
+            DelayedTransport,
+            Url::parse("https://camera.test/onvif/device_service").unwrap(),
+            None,
+            None,
+        );
+        let error = RecordingClient::new(&client, Duration::from_millis(20))
+            .search_with_options(
+                None,
+                None,
+                1,
+                SearchOptions {
+                    max_polls: 1,
+                    wait_time: Duration::from_secs(1),
+                    poll_interval: Duration::ZERO,
+                    keep_alive: Duration::from_secs(45),
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            ProbeError::OperationTimeout { operation, .. } if operation == "ONVIF GetServices"
+        ));
+    }
+
+    #[tokio::test]
+    async fn bounded_search_reports_pending_state_and_still_ends_the_session() {
+        let (client, actions) = client(vec![SERVICES, FIND, IN_PROGRESS, END]);
+        let error = RecordingClient::new(&client, Duration::from_secs(2))
+            .search_with_options(
+                None,
+                None,
+                1,
+                SearchOptions {
+                    max_polls: 1,
+                    wait_time: Duration::from_secs(1),
+                    poll_interval: Duration::ZERO,
+                    keep_alive: Duration::from_secs(45),
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            ProbeError::OperationTimeout { operation, .. }
+                if operation.contains("poll limit 1") && operation.contains("state=Searching")
+        ));
+        assert!(
+            actions
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|action| action.ends_with("/EndSearch"))
+        );
     }
 
     #[test]
