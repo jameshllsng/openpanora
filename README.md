@@ -107,8 +107,13 @@ Recording Search is read-only. The probe bounds polling, uses a ten-second
 ONVIF keep-alive request, and attempts `EndSearch` after a session was created.
 `--start` and `--end` filter recording metadata returned by the device; they do
 not claim frame-accurate video boundaries. See
-[remote-recordings.md](docs/remote-recordings.md) for the compatibility and
-export evidence required before enabling a user-facing export feature.
+[remote-recordings.md](docs/remote-recordings.md) for compatibility and export
+evidence required before enabling a user-facing export feature. Replay tests first perform redacted RTSP `OPTIONS` and
+`DESCRIBE` checks (including Digest when challenged), then require GStreamer to
+decode a buffer over RTP/TCP. A replay test timeout reports the last completed
+stage. `replay-test --start <UTC>` is accepted as an explicit investigation
+parameter but currently refuses to send a clock `Range` request until that
+device's replay semantics are verified.
 
 Exit codes are `0` for success, `2` for invalid input, `4` for authentication,
 `5` for timeouts, `6` for unsupported operations, and `1` for other failures.

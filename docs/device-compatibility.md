@@ -6,7 +6,7 @@ certificate exceptions.
 
 | Device / firmware | Device information | Media profiles | Recording Search | Replay | Export |
 |---|---|---|---|---|---|
-| IntelBras NVD 3332, 4.001.00IB001.0.T (build 2025-08-08) | verified | verified | advertised; operation unverified | advertised; operation unverified | unverified |
+| IntelBras NVD 3332, 4.001.00IB001.0.T (build 2025-08-08) | verified | verified | summary and inventory verified; search execution unverified | URI retrieval verified; playback unverified | unverified |
 
 The NVD entry was authenticated through HTTPS with HTTP Digest in an authorized
 environment. Its certificate was not trusted by that development host, so a
@@ -16,9 +16,7 @@ deployments.
 
 Next evidence to collect, manually and with sanitized output:
 
-1. `recordings summary` response.
-2. `recordings list` response and recording-token shape.
-3. Full search-token lifecycle including an empty result set.
-4. Replay URI response without exposing its query data.
-5. GStreamer replay decode behavior and codecs.
-6. Replay clock/range behavior needed to assess export accuracy.
+1. Full search-token lifecycle including an empty result set.
+2. RTSP `OPTIONS`/`DESCRIBE` authentication for a returned replay URI.
+3. GStreamer replay decode behavior and codecs.
+4. Replay clock/range behavior needed to assess export accuracy.

@@ -63,14 +63,17 @@ pub struct ReplayConfiguration {
 
 pub struct RecordingClient<'a, T> {
     client: &'a OnvifClient<T>,
+    started: Instant,
     deadline: Instant,
 }
 
 impl<'a, T: SoapTransport> RecordingClient<'a, T> {
     pub fn new(client: &'a OnvifClient<T>, timeout: Duration) -> Self {
+        let started = Instant::now();
         Self {
             client,
-            deadline: Instant::now() + timeout,
+            started,
+            deadline: started + timeout,
         }
     }
 
@@ -235,7 +238,10 @@ impl<'a, T: SoapTransport> RecordingClient<'a, T> {
                 return Ok(recordings);
             }
         }
-        Err(ProbeError::Timeout)
+        Err(ProbeError::OperationTimeout {
+            operation: "ONVIF GetRecordingSearchResults (bounded polling)".into(),
+            elapsed_ms: self.deadline_elapsed_ms(),
+        })
     }
 
     async fn recording_information(
@@ -277,7 +283,12 @@ impl<'a, T: SoapTransport> RecordingClient<'a, T> {
     }
 
     async fn service_endpoint(&self, needle: &str) -> Result<Url, ProbeError> {
-        let services = self.client.services().await?;
+        let started = Instant::now();
+        let services = self
+            .client
+            .services()
+            .await
+            .map_err(|error| self.operation_error("ONVIF GetServices", started, error))?;
         let service = services
             .iter()
             .find(|service| service.namespace.contains(needle))
@@ -295,9 +306,25 @@ impl<'a, T: SoapTransport> RecordingClient<'a, T> {
         body: &str,
     ) -> Result<String, ProbeError> {
         self.ensure_before_deadline(&AtomicBool::new(false))?;
+        let started = Instant::now();
         self.client
             .call_service(endpoint, &format!("{namespace}/{operation}"), body)
             .await
+            .map_err(|error| self.operation_error(&format!("ONVIF {operation}"), started, error))
+    }
+
+    fn operation_error(&self, operation: &str, started: Instant, error: ProbeError) -> ProbeError {
+        match error {
+            ProbeError::Timeout => ProbeError::OperationTimeout {
+                operation: operation.to_owned(),
+                elapsed_ms: started.elapsed().as_millis(),
+            },
+            other => other,
+        }
+    }
+
+    fn deadline_elapsed_ms(&self) -> u128 {
+        self.started.elapsed().as_millis()
     }
 
     fn ensure_before_deadline(&self, cancellation: &AtomicBool) -> Result<(), ProbeError> {
@@ -583,15 +610,21 @@ mod tests {
     const END: &str = r#"<Envelope><Body><EndSearchResponse/></Body></Envelope>"#;
 
     fn client(responses: Vec<&str>) -> (OnvifClient<MockTransport>, Arc<Mutex<Vec<String>>>) {
+        client_results(
+            responses
+                .into_iter()
+                .map(|response| Ok(response.to_owned()))
+                .collect(),
+        )
+    }
+
+    fn client_results(
+        responses: Vec<Result<String, ProbeError>>,
+    ) -> (OnvifClient<MockTransport>, Arc<Mutex<Vec<String>>>) {
         let actions = Arc::new(Mutex::new(Vec::new()));
         let client = OnvifClient::new(
             MockTransport {
-                responses: Mutex::new(
-                    responses
-                        .into_iter()
-                        .map(|response| Ok(response.to_owned()))
-                        .collect(),
-                ),
+                responses: Mutex::new(responses.into()),
                 actions: actions.clone(),
             },
             Url::parse("https://camera.test/onvif/device_service").unwrap(),
@@ -642,6 +675,19 @@ mod tests {
             .unwrap_err();
         assert!(matches!(error, ProbeError::Cancelled));
         assert!(actions.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn identifies_the_specific_recording_search_operation_that_times_out() {
+        let (client, _) = client_results(vec![Ok(SERVICES.into()), Err(ProbeError::Timeout)]);
+        let error = RecordingClient::new(&client, Duration::from_secs(2))
+            .search(None, None, 1)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            ProbeError::OperationTimeout { operation, .. } if operation == "ONVIF FindRecordings"
+        ));
     }
 
     #[test]

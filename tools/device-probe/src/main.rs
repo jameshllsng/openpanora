@@ -86,9 +86,12 @@ async fn run(cli: Cli) -> Result<(), ProbeError> {
                     )?;
                 }
                 RecordingsCommand::ReplayTest(args) => {
-                    let replay = recordings.replay_uri(&args.recording_token).await?;
-                    let result =
-                        rtsp::test_with_credentials(replay.url(), credentials.as_ref(), timeout)?;
+                    let replay = recordings.replay_uri(&args.replay.recording_token).await?;
+                    let result = rtsp::test_replay_with_credentials(
+                        replay.url(),
+                        credentials.as_ref(),
+                        rtsp::ReplayTestOptions::new(timeout, args.start.is_some()),
+                    )?;
                     output::print_replay_test(&replay, &result, json)?;
                 }
             }

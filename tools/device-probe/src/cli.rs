@@ -62,7 +62,7 @@ pub enum RecordingsCommand {
     /// Read Replay Control configuration without changing it.
     ReplayConfiguration,
     /// Request a replay URI and require GStreamer to decode a media buffer.
-    ReplayTest(ReplayArgs),
+    ReplayTest(ReplayTestArgs),
 }
 
 #[derive(Debug, Args)]
@@ -85,6 +85,17 @@ pub struct ReplayArgs {
     /// Recording token returned by `recordings list` or `recordings search`.
     #[arg(long)]
     pub recording_token: String,
+}
+
+#[derive(Debug, Args)]
+pub struct ReplayTestArgs {
+    #[command(flatten)]
+    pub replay: ReplayArgs,
+
+    /// Requested UTC replay start (RFC 3339). The probe refuses to send a clock Range until
+    /// the device's ONVIF replay semantics have been verified.
+    #[arg(long, value_parser = parse_utc)]
+    pub start: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone, Args)]

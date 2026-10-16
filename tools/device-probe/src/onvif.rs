@@ -36,6 +36,8 @@ pub enum ProbeError {
     Tls(String),
     #[error("request timed out")]
     Timeout,
+    #[error("{operation} timed out after {elapsed_ms} ms")]
+    OperationTimeout { operation: String, elapsed_ms: u128 },
     #[error("operation was cancelled")]
     Cancelled,
     #[error("device does not support the requested operation: {0}")]
@@ -56,7 +58,7 @@ impl ProbeError {
     pub fn exit_code(&self) -> u8 {
         match self {
             Self::Authentication | Self::InvalidCredentials | Self::HttpUnauthorized => 4,
-            Self::Timeout => 5,
+            Self::Timeout | Self::OperationTimeout { .. } => 5,
             Self::Unsupported(_) => 6,
             Self::Input(_) => 2,
             _ => 1,

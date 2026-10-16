@@ -143,6 +143,10 @@ pub fn print_replay_test(
                 "query_parameters_redacted": true,
                 "decoded_buffer_observed": result.decoded_buffer_observed,
                 "elapsed_ms": result.elapsed_ms,
+                "rtsp_transport": result.rtsp_transport,
+                "onvif_mode_enabled": result.onvif_mode_enabled,
+                "replay_query_preserved": result.replay_query_preserved,
+                "diagnostics": result.diagnostics,
             })
         );
     } else {
@@ -150,6 +154,16 @@ pub fn print_replay_test(
         println!("  URI: {}", replay.display());
         println!("  Buffer observed: {}", result.decoded_buffer_observed);
         println!("  Elapsed: {} ms", result.elapsed_ms);
+        println!("  RTSP transport: {}", result.rtsp_transport);
+        println!("  ONVIF replay mode: {}", result.onvif_mode_enabled);
+        println!(
+            "  Replay query preserved: {}",
+            result.replay_query_preserved
+        );
+        println!("  Stages:");
+        for stage in &result.diagnostics {
+            println!("    - {:?}: {} ms", stage.stage, stage.elapsed_ms);
+        }
     }
     Ok(())
 }

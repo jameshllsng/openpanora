@@ -27,8 +27,18 @@ as a positive time-range match.
 `replay-uri` sends `GetReplayUri` requesting unicast RTP over RTSP. A returned
 URI is accepted only when it is RTSP/RTSPS, credential-free, and hosted by the
 selected device or an explicitly approved alternate service host. `replay-test`
-uses that URI and requires a GStreamer decoded buffer. Neither command changes
-recording configuration or downloads video.
+uses that URI unchanged (including its opaque query parameters), first performs
+read-only RTSP `OPTIONS`/`DESCRIBE` authentication checks, then configures
+GStreamer `rtspsrc` for RTP/TCP and ONVIF mode before requiring a decoded
+buffer. Diagnostics identify whether the failure is before RTSP authentication,
+before `DESCRIBE`, or during later GStreamer startup/decoding. Neither command
+changes recording configuration or downloads video.
+
+ONVIF replay start uses an RTSP `Range: clock=...` request at `PLAY`; it is not
+equivalent to an ordinary live RTSP seek. The `replay-test --start <UTC>` option
+therefore currently stops with an explicit unsupported result rather than
+silently ignoring the timestamp or emitting an unverified range. This remains
+the next device-validation step.
 
 ## Current export conclusion
 
