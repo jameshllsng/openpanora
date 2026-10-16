@@ -98,6 +98,11 @@ memory, supplies Secret-Service credentials to GStreamer without displaying
 them, and sends RTSP over TCP. **Test video surface** is a local synthetic
 source for validating GTK/GStreamer wiring; it is not camera playback.
 
+Live sessions reconnect only for bounded transient failures: up to three
+attempts after 1, 2, and 4 seconds. Selecting another device/profile, starting
+a new session, or pressing Stop cancels any scheduled retry. Authentication and
+decoder/configuration errors are not retried automatically.
+
 WSL2 requires WSLg or another functioning Wayland/X11 display. Compilation and
 unit tests do not prove that the GUI can open on a particular WSL installation.
 

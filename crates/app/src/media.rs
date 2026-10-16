@@ -11,6 +11,7 @@ use std::{
 use url::Url;
 
 const STARTUP_FRAME_TIMEOUT: Duration = Duration::from_secs(10);
+pub const MAX_AUTOMATIC_RECONNECTS: u8 = 3;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LiveState {
@@ -20,6 +21,45 @@ pub enum LiveState {
     ReceivingVideo,
     Stalled,
     Error,
+    Reconnecting,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FailureKind {
+    Transient,
+    Permanent,
+}
+
+#[derive(Debug, Default)]
+pub struct ReconnectPlan {
+    attempts: u8,
+    pending: bool,
+}
+
+impl ReconnectPlan {
+    pub fn schedule(&mut self, transient: bool) -> Option<(u8, Duration)> {
+        if !transient || self.pending {
+            return None;
+        }
+        let attempt = self.attempts.saturating_add(1);
+        let delay = reconnect_delay(attempt)?;
+        self.attempts = attempt;
+        self.pending = true;
+        Some((attempt, delay))
+    }
+    pub fn retry_fired(&mut self) {
+        self.pending = false;
+    }
+    pub fn pending(&self) -> bool {
+        self.pending
+    }
+    pub fn cancel(&mut self) {
+        self.attempts = 0;
+        self.pending = false;
+    }
+    pub fn recovered(&mut self) {
+        self.cancel();
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -28,6 +68,7 @@ pub struct LiveDiagnostics {
     pub decoded_frames: u64,
     pub last_frame_age: Option<Duration>,
     pub startup_timed_out: bool,
+    pub failure: Option<FailureKind>,
 }
 
 #[derive(Default)]
@@ -42,6 +83,8 @@ pub struct LiveSession {
     metrics: Arc<Mutex<FrameMetrics>>,
     started: Instant,
     state: LiveState,
+    failure: Option<FailureKind>,
+    restart: Option<(Url, Credentials)>,
 }
 
 impl LiveSession {
@@ -55,6 +98,8 @@ impl LiveSession {
             metrics: Arc::new(Mutex::new(FrameMetrics::default())),
             started: Instant::now(),
             state: LiveState::Disconnected,
+            failure: None,
+            restart: None,
         })
     }
 
@@ -70,6 +115,7 @@ impl LiveSession {
         authenticated
             .set_password(Some(&credentials.password))
             .map_err(|_| "RTSP password cannot be represented safely".to_owned())?;
+        self.restart = Some((uri.clone(), credentials.clone()));
         let sink = self.paintable_sink()?;
         let filter = self.frame_probe_filter()?;
         let playbin = gst::ElementFactory::make("playbin")
@@ -116,6 +162,20 @@ impl LiveSession {
         }
         self.picture.set_paintable(None::<&gtk::gdk::Paintable>);
         self.state = LiveState::Disconnected;
+        self.failure = None;
+        self.restart = None;
+    }
+
+    pub fn reconnect(&mut self) -> Result<(), String> {
+        let Some((uri, credentials)) = self.restart.clone() else {
+            return Err("there is no reconnectable RTSP session".into());
+        };
+        self.restart = Some((uri.clone(), credentials.clone()));
+        self.start_rtsp(&uri, &credentials)
+    }
+
+    pub fn mark_reconnecting(&mut self) {
+        self.state = LiveState::Reconnecting;
     }
 
     /// Processes queued bus messages; no URI, credentials, or GStreamer debug text escapes.
@@ -129,7 +189,10 @@ impl LiveSession {
                 gst::MessageType::AsyncDone,
             ]) {
                 match message.view() {
-                    gst::MessageView::Error(_) => self.state = LiveState::Error,
+                    gst::MessageView::Error(error) => {
+                        self.failure = Some(classify_gstreamer_error(&error.error().to_string()));
+                        self.state = LiveState::Error;
+                    }
                     gst::MessageView::Eos(..) => self.state = LiveState::Stalled,
                     gst::MessageView::Buffering(_) => self.state = LiveState::Buffering,
                     gst::MessageView::StateChanged(state)
@@ -148,6 +211,7 @@ impl LiveSession {
             metrics.decoded_frames == 0 && self.started.elapsed() >= STARTUP_FRAME_TIMEOUT;
         if metrics.decoded_frames > 0 {
             self.state = LiveState::ReceivingVideo;
+            self.failure = None;
         } else if startup_timed_out
             && !matches!(self.state, LiveState::Error | LiveState::Disconnected)
         {
@@ -158,6 +222,7 @@ impl LiveSession {
             decoded_frames: metrics.decoded_frames,
             last_frame_age: age,
             startup_timed_out,
+            failure: self.failure,
         }
     }
 
@@ -196,11 +261,43 @@ impl LiveSession {
         self.started = Instant::now();
         *self.metrics.lock().expect("frame metrics mutex poisoned") = FrameMetrics::default();
         self.state = LiveState::Connecting;
+        self.failure = None;
         pipeline
             .set_state(gst::State::Playing)
             .map_err(|_| "GStreamer could not start the media pipeline".to_owned())?;
         self.pipeline = Some(pipeline);
         Ok(())
+    }
+}
+
+pub fn reconnect_delay(attempt: u8) -> Option<Duration> {
+    match attempt {
+        1 => Some(Duration::from_secs(1)),
+        2 => Some(Duration::from_secs(2)),
+        3 => Some(Duration::from_secs(4)),
+        _ => None,
+    }
+}
+
+fn classify_gstreamer_error(text: &str) -> FailureKind {
+    let text = text.to_ascii_lowercase();
+    if [
+        "unauthorized",
+        "not authorized",
+        "authentication",
+        "401",
+        "403",
+        "missing plugin",
+        "no decoder",
+        "not-negotiated",
+        "unsupported",
+    ]
+    .iter()
+    .any(|marker| text.contains(marker))
+    {
+        FailureKind::Permanent
+    } else {
+        FailureKind::Transient
     }
 }
 
@@ -242,5 +339,43 @@ mod tests {
             .timed_pop_filtered(gst::ClockTime::from_seconds(2), &[gst::MessageType::Eos]);
         assert_eq!(metrics.lock().unwrap().decoded_frames, 3);
         let _ = pipeline.set_state(gst::State::Null);
+    }
+
+    #[test]
+    fn retry_policy_is_bounded_and_exponential() {
+        assert_eq!(reconnect_delay(1), Some(Duration::from_secs(1)));
+        assert_eq!(reconnect_delay(2), Some(Duration::from_secs(2)));
+        assert_eq!(reconnect_delay(3), Some(Duration::from_secs(4)));
+        assert_eq!(reconnect_delay(4), None);
+    }
+
+    #[test]
+    fn permanent_error_classification_does_not_retry() {
+        assert_eq!(
+            classify_gstreamer_error("Unauthorized"),
+            FailureKind::Permanent
+        );
+        assert_eq!(
+            classify_gstreamer_error("missing plugin"),
+            FailureKind::Permanent
+        );
+        assert_eq!(
+            classify_gstreamer_error("connection timed out"),
+            FailureKind::Transient
+        );
+    }
+
+    #[test]
+    fn reconnect_plan_is_cancelable_and_resets_after_recovery() {
+        let mut plan = ReconnectPlan::default();
+        assert_eq!(plan.schedule(true).map(|value| value.0), Some(1));
+        assert!(plan.schedule(true).is_none());
+        plan.cancel();
+        assert_eq!(plan.schedule(true).map(|value| value.0), Some(1));
+        plan.retry_fired();
+        assert_eq!(plan.schedule(true).map(|value| value.0), Some(2));
+        plan.recovered();
+        assert_eq!(plan.schedule(true).map(|value| value.0), Some(1));
+        assert!(ReconnectPlan::default().schedule(false).is_none());
     }
 }

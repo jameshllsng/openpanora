@@ -457,12 +457,32 @@ fn live_view(repository: Rc<SqliteDeviceRepository>) -> gtk::Box {
     controls.append(&status);
     let session = Rc::new(RefCell::new(None::<media::LiveSession>));
     let generation = Rc::new(Cell::new(0_u64));
+    let reconnect_plan = Rc::new(RefCell::new(media::ReconnectPlan::default()));
+    for selector in [
+        devices.clone().upcast::<gtk::Widget>(),
+        profiles.clone().upcast(),
+    ] {
+        let session = session.clone();
+        let generation = generation.clone();
+        let plan = reconnect_plan.clone();
+        let status = status.clone();
+        selector.connect_notify_local(Some("selected"), move |_, _| {
+            generation.set(generation.get().wrapping_add(1));
+            plan.borrow_mut().cancel();
+            if let Some(mut session) = session.borrow_mut().take() {
+                session.stop();
+            }
+            status.set_text("Disconnected");
+        });
+    }
     let session_start = session.clone();
     let picture_start = picture.clone();
     let status_start = status.clone();
     let generation_test = generation.clone();
+    let reconnect_plan_test = reconnect_plan.clone();
     test.connect_clicked(move |_| {
         generation_test.set(generation_test.get().wrapping_add(1));
+        reconnect_plan_test.borrow_mut().cancel();
         if let Some(mut old) = session_start.borrow_mut().take() {
             old.stop();
         }
@@ -540,6 +560,7 @@ fn live_view(repository: Rc<SqliteDeviceRepository>) -> gtk::Box {
     let picture_live = picture.clone();
     let status_live = status.clone();
     let generation_live = generation.clone();
+    let reconnect_plan_live = reconnect_plan.clone();
     start.connect_clicked(move |_| {
         let Some(id) = devices_start.active_id() else {
             status_live.set_text("Select a device and an ONVIF profile first");
@@ -565,6 +586,7 @@ fn live_view(repository: Rc<SqliteDeviceRepository>) -> gtk::Box {
         };
         status_live.set_text("Requesting a live stream URI…");
         generation_live.set(generation_live.get().wrapping_add(1));
+        reconnect_plan_live.borrow_mut().cancel();
         let request_generation = generation_live.get();
         if let Some(mut old) = session_live.borrow_mut().take() {
             old.stop();
@@ -608,8 +630,10 @@ fn live_view(repository: Rc<SqliteDeviceRepository>) -> gtk::Box {
     let session_stop = session.clone();
     let status_stop = status.clone();
     let generation_stop = generation.clone();
+    let reconnect_plan_stop = reconnect_plan.clone();
     stop.connect_clicked(move |_| {
         generation_stop.set(generation_stop.get().wrapping_add(1));
+        reconnect_plan_stop.borrow_mut().cancel();
         if let Some(mut value) = session_stop.borrow_mut().take() {
             value.stop();
         }
@@ -617,6 +641,8 @@ fn live_view(repository: Rc<SqliteDeviceRepository>) -> gtk::Box {
     });
     let session_events = session.clone();
     let status_events = status.clone();
+    let generation_events = generation.clone();
+    let reconnect_plan_events = reconnect_plan.clone();
     gtk::glib::timeout_add_local(Duration::from_millis(250), move || {
         if let Some(session) = session_events.borrow_mut().as_mut() {
             let diagnostics = session.poll();
@@ -628,14 +654,49 @@ fn live_view(repository: Rc<SqliteDeviceRepository>) -> gtk::Box {
                     status_events.set_text("RTSP connected; buffering video…")
                 }
                 media::LiveState::ReceivingVideo => {
+                    reconnect_plan_events.borrow_mut().recovered();
                     status_events.set_text("Receiving decoded video")
                 }
                 media::LiveState::Stalled => status_events
-                    .set_text("No decoded video frames arrived before the startup timeout"),
+                    .set_text("Video stalled; reconnection will be attempted if retries remain"),
                 media::LiveState::Error => {
                     status_events.set_text("GStreamer stream, authentication, or decoder error")
                 }
+                media::LiveState::Reconnecting => status_events.set_text("Reconnecting…"),
                 media::LiveState::Disconnected => status_events.set_text("Disconnected"),
+            }
+            let transient_failure = diagnostics.state == media::LiveState::Stalled
+                || (diagnostics.state == media::LiveState::Error
+                    && diagnostics.failure == Some(media::FailureKind::Transient));
+            if let Some((attempt, delay)) = reconnect_plan_events
+                .borrow_mut()
+                .schedule(transient_failure)
+            {
+                session.mark_reconnecting();
+                status_events.set_text(&format!(
+                    "Reconnecting ({attempt}/{})…",
+                    media::MAX_AUTOMATIC_RECONNECTS
+                ));
+                let expected_generation = generation_events.get();
+                let session = session_events.clone();
+                let status = status_events.clone();
+                let generation = generation_events.clone();
+                let plan = reconnect_plan_events.clone();
+                gtk::glib::timeout_add_local_once(delay, move || {
+                    if generation.get() != expected_generation {
+                        return;
+                    }
+                    plan.borrow_mut().retry_fired();
+                    if let Some(session) = session.borrow_mut().as_mut() {
+                        if session.reconnect().is_err() {
+                            status.set_text("Automatic reconnect could not start");
+                        } else {
+                            status.set_text("Reconnecting to RTSP stream…");
+                        }
+                    }
+                });
+            } else if transient_failure && !reconnect_plan_events.borrow().pending() {
+                status_events.set_text("Video stalled; automatic reconnect limit reached");
             }
         }
         gtk::glib::ControlFlow::Continue

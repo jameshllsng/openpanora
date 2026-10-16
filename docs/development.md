@@ -60,6 +60,16 @@ as proof that frames are visible. If no decoded frame arrives within ten
 seconds, it reports a startup stall. GStreamer errors are deliberately reduced
 to a safe category because debug text can contain stream addresses.
 
+## Live reconnection
+
+For an explicitly started RTSP live session, transient GStreamer/network errors,
+EOS, and a startup with no decoded buffers can trigger at most three automatic
+reconnects. Delays are 1, 2, and 4 seconds. Authentication failures, missing
+decoders/plugins, unsupported negotiation, and invalid stream setup are
+classified as permanent and are not retried automatically. Stop, a profile or
+device selection change, and a new Start invalidate all delayed retries. The
+user can still use the explicit Retry control after correcting a configuration.
+
 ### WSLg diagnostics
 
 WSLg may emit EGL/Zink warnings even when GTK starts. They are environment
