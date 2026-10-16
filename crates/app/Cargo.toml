@@ -1,6 +1,13 @@
 [package]
-name = "app"
-version = "0.1.0"
-edition = "2024"
+name = "openpanora"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
 
 [dependencies]
+gtk = { package = "gtk4", version = "0.10", features = ["v4_14"] }
+openpanora-core = { path = "../core" }
+device-probe = { path = "../../tools/device-probe" }
+keyring = { version = "3", features = ["linux-native"] }
+tokio = { version = "1", features = ["rt-multi-thread"] }
+url = "2"

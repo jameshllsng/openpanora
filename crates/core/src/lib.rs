@@ -1,14 +1,9 @@
-pub fn add(left: u64, right: u64) -> u64 {
-    left + right
-}
+//! Domain types and application contracts shared by OpenPanora front ends.
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+mod domain;
+mod ports;
+mod storage;
 
-    #[test]
-    fn it_works() {
-        let result = add(2, 2);
-        assert_eq!(result, 4);
-    }
-}
+pub use domain::*;
+pub use ports::*;
+pub use storage::{SqliteDeviceRepository, StorageError};
