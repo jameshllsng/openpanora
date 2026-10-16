@@ -5,7 +5,7 @@ use device_probe::{
     onvif::{HttpSoapTransport, OnvifClient},
 };
 use gtk::prelude::*;
-use openpanora_core::{Device, DeviceRepository, SqliteDeviceRepository};
+use openpanora_core::{CompatibilityReport, Device, DeviceRepository, SqliteDeviceRepository};
 use std::{rc::Rc, sync::mpsc, time::Duration};
 use url::Url;
 
@@ -231,16 +231,23 @@ fn dialog(
     let endpoint = gtk::Entry::new();
     let username = gtk::Entry::new();
     let password = gtk::PasswordEntry::new();
+    let tls_ca_file = gtk::Entry::new();
+    tls_ca_file.set_placeholder_text(Some("Optional PEM CA file"));
+    let insecure_tls =
+        gtk::CheckButton::with_label("Unsafe: accept invalid TLS certificate (diagnostics only)");
     if let Some(device) = &existing {
         name.set_text(&device.name);
         endpoint.set_text(&device.host);
         username.set_text(device.credential_key.as_deref().unwrap_or(""));
+        tls_ca_file.set_text(device.tls_ca_file.as_deref().unwrap_or(""));
+        insecure_tls.set_active(device.insecure_tls);
     }
     for (index, (label, field)) in [
         ("Display name", name.clone().upcast::<gtk::Widget>()),
         ("ONVIF service URL", endpoint.clone().upcast()),
         ("Username", username.clone().upcast()),
         ("Password (Secret Service)", password.clone().upcast()),
+        ("Trusted CA PEM", tls_ca_file.clone().upcast()),
     ]
     .into_iter()
     .enumerate()
@@ -257,6 +264,7 @@ fn dialog(
         );
         grid.attach(&field, 1, index as i32, 1, 1);
     }
+    grid.attach(&insecure_tls, 1, 5, 1, 1);
     dialog.content_area().append(&grid);
     let refresh_parent = parent.clone();
     dialog.connect_response(move |dialog, response| {
@@ -279,6 +287,9 @@ fn dialog(
             device.port = url.port_or_known_default().unwrap_or(80);
             device.credential_key =
                 (!username.text().is_empty()).then(|| username.text().to_string());
+            device.tls_ca_file =
+                (!tls_ca_file.text().is_empty()).then(|| tls_ca_file.text().to_string());
+            device.insecure_tls = insecure_tls.is_active();
             if let (Some(user), false) =
                 (device.credential_key.as_deref(), password.text().is_empty())
             {
@@ -341,15 +352,38 @@ fn inspect_blocking(device: Device) -> Result<String, String> {
     let transport = HttpSoapTransport::new(
         Duration::from_secs(10),
         Some(Credentials { username, password }),
-        false,
-        None,
+        device.insecure_tls,
+        device.tls_ca_file.as_deref().map(std::path::Path::new),
     )
     .map_err(|error| error.to_string())?;
     let report = runtime
         .block_on(OnvifClient::new(transport, endpoint, None, None).inspect())
         .map_err(|error| error.to_string())?;
+    format_verified_inspection(report)
+}
+
+fn format_verified_inspection(report: CompatibilityReport) -> Result<String, String> {
+    let device_information = report.device.ok_or_else(|| {
+        "device identification was not verified; refusing to report a successful connection"
+            .to_owned()
+    })?;
+    if report.services.is_empty() {
+        return Err("ONVIF service discovery returned no services".into());
+    }
+    if report.media_profiles.is_empty() {
+        return Err("media profile discovery returned no profiles".into());
+    }
     Ok(format!(
-        "Connected: {} service(s), {} media profile(s)",
+        "Verified: {} {} · firmware {} · {} service(s), {} media profile(s)",
+        device_information
+            .manufacturer
+            .unwrap_or_else(|| "Unknown manufacturer".into()),
+        device_information
+            .model
+            .unwrap_or_else(|| "unknown model".into()),
+        device_information
+            .firmware
+            .unwrap_or_else(|| "unknown".into()),
         report.services.len(),
         report.media_profiles.len()
     ))
@@ -409,4 +443,20 @@ fn row(title: &str, detail: &str) -> gtk::ListBoxRow {
             .build(),
     );
     gtk::ListBoxRow::builder().child(&box_).build()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn incomplete_inspection_is_not_a_successful_connection() {
+        let report = CompatibilityReport {
+            device: None,
+            services: Vec::new(),
+            media_profiles: Vec::new(),
+            capabilities: Vec::new(),
+        };
+        assert!(format_verified_inspection(report).is_err());
+    }
 }

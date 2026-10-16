@@ -47,10 +47,18 @@ impl SqliteDeviceRepository {
                  model TEXT,
                  firmware TEXT,
                  credential_key TEXT,
+                 tls_ca_file TEXT,
+                 insecure_tls INTEGER NOT NULL DEFAULT 0,
                  created_at TEXT NOT NULL,
                  updated_at TEXT NOT NULL
              );",
             )?;
+        let connection = self.connection.lock().expect("database mutex poisoned");
+        let _ = connection.execute("ALTER TABLE devices ADD COLUMN tls_ca_file TEXT", []);
+        let _ = connection.execute(
+            "ALTER TABLE devices ADD COLUMN insecure_tls INTEGER NOT NULL DEFAULT 0",
+            [],
+        );
         Ok(())
     }
 }
@@ -65,13 +73,14 @@ impl DeviceRepository for SqliteDeviceRepository {
             .execute(
                 "INSERT INTO devices (
                     id, name, host, port, kind, manufacturer, model, firmware,
-                    credential_key, created_at, updated_at
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+                    credential_key, tls_ca_file, insecure_tls, created_at, updated_at
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
                  ON CONFLICT(id) DO UPDATE SET
                     name = excluded.name, host = excluded.host, port = excluded.port,
                     kind = excluded.kind, manufacturer = excluded.manufacturer,
                     model = excluded.model, firmware = excluded.firmware,
-                    credential_key = excluded.credential_key, updated_at = excluded.updated_at",
+                    credential_key = excluded.credential_key, tls_ca_file = excluded.tls_ca_file,
+                    insecure_tls = excluded.insecure_tls, updated_at = excluded.updated_at",
                 params![
                     device.id.to_string(),
                     device.name,
@@ -82,6 +91,8 @@ impl DeviceRepository for SqliteDeviceRepository {
                     device.model,
                     device.firmware,
                     device.credential_key,
+                    device.tls_ca_file,
+                    device.insecure_tls,
                     device.created_at.to_rfc3339(),
                     device.updated_at.to_rfc3339(),
                 ],
@@ -95,7 +106,7 @@ impl DeviceRepository for SqliteDeviceRepository {
         let mut statement = connection
             .prepare(
                 "SELECT id, name, host, port, kind, manufacturer, model, firmware,
-                        credential_key, created_at, updated_at
+                        credential_key, tls_ca_file, insecure_tls, created_at, updated_at
                  FROM devices WHERE id = ?1",
             )
             .map_err(|error| ApplicationError::Transport(error.to_string()))?;
@@ -110,7 +121,7 @@ impl DeviceRepository for SqliteDeviceRepository {
         let mut statement = connection
             .prepare(
                 "SELECT id, name, host, port, kind, manufacturer, model, firmware,
-                        credential_key, created_at, updated_at
+                        credential_key, tls_ca_file, insecure_tls, created_at, updated_at
                  FROM devices ORDER BY name COLLATE NOCASE",
             )
             .map_err(|error| ApplicationError::Transport(error.to_string()))?;
@@ -134,8 +145,8 @@ impl DeviceRepository for SqliteDeviceRepository {
 fn row_to_device(row: &rusqlite::Row<'_>) -> rusqlite::Result<Device> {
     let id: String = row.get(0)?;
     let kind: String = row.get(4)?;
-    let created_at: String = row.get(9)?;
-    let updated_at: String = row.get(10)?;
+    let created_at: String = row.get(11)?;
+    let updated_at: String = row.get(12)?;
     Ok(Device {
         id: Uuid::parse_str(&id).map_err(conversion_error)?,
         name: row.get(1)?,
@@ -146,6 +157,8 @@ fn row_to_device(row: &rusqlite::Row<'_>) -> rusqlite::Result<Device> {
         model: row.get(6)?,
         firmware: row.get(7)?,
         credential_key: row.get(8)?,
+        tls_ca_file: row.get(9)?,
+        insecure_tls: row.get::<_, i64>(10)? != 0,
         created_at: chrono::DateTime::parse_from_rfc3339(&created_at)
             .map_err(conversion_error)?
             .with_timezone(&chrono::Utc),
@@ -180,5 +193,18 @@ mod tests {
 
         assert!(repository.remove(device.id).unwrap());
         assert!(repository.list().unwrap().is_empty());
+    }
+
+    #[test]
+    fn persists_tls_configuration_without_credentials() {
+        let repository = SqliteDeviceRepository::in_memory().unwrap();
+        let mut device = Device::new("NVR", "https://camera.test/onvif/device_service", 443);
+        device.tls_ca_file = Some("/tmp/device-ca.pem".into());
+        device.insecure_tls = true;
+        repository.save(&device).unwrap();
+        let loaded = repository.get(device.id).unwrap().unwrap();
+        assert_eq!(loaded.tls_ca_file, device.tls_ca_file);
+        assert!(loaded.insecure_tls);
+        assert!(loaded.credential_key.is_none());
     }
 }

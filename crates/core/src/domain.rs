@@ -22,6 +22,8 @@ pub struct Device {
     pub model: Option<String>,
     pub firmware: Option<String>,
     pub credential_key: Option<String>,
+    pub tls_ca_file: Option<String>,
+    pub insecure_tls: bool,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -39,6 +41,8 @@ impl Device {
             model: None,
             firmware: None,
             credential_key: None,
+            tls_ca_file: None,
+            insecure_tls: false,
             created_at: now,
             updated_at: now,
         }
