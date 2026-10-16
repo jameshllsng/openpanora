@@ -9,7 +9,12 @@ use gtk::prelude::*;
 use openpanora_core::{
     CompatibilityReport, Device, DeviceRepository, MediaProfile, SqliteDeviceRepository,
 };
-use std::{rc::Rc, sync::mpsc, time::Duration};
+use std::{
+    cell::{Cell, RefCell},
+    rc::Rc,
+    sync::mpsc,
+    time::Duration,
+};
 use url::Url;
 
 const APP_ID: &str = "org.openpanora.OpenPanora";
@@ -414,7 +419,16 @@ fn live_view(repository: Rc<SqliteDeviceRepository>) -> gtk::Box {
             devices.append(Some(&device.id.to_string()), &device.name);
         }
     }
-    let profiles = gtk::ComboBoxText::new();
+    let profiles = gtk::ListBox::builder()
+        .selection_mode(gtk::SelectionMode::Single)
+        .build();
+    let profiles_scroll = gtk::ScrolledWindow::builder()
+        .child(&profiles)
+        .min_content_height(150)
+        .max_content_height(220)
+        .vexpand(false)
+        .build();
+    let profile_tokens = Rc::new(RefCell::new(Vec::<String>::new()));
     let discover = gtk::Button::with_label("Discover profiles");
     let selectors = gtk::Grid::builder()
         .column_spacing(8)
@@ -424,7 +438,7 @@ fn live_view(repository: Rc<SqliteDeviceRepository>) -> gtk::Box {
     selectors.attach(&devices, 1, 0, 1, 1);
     selectors.attach(&discover, 2, 0, 1, 1);
     selectors.attach(&gtk::Label::new(Some("Profile")), 0, 1, 1, 1);
-    selectors.attach(&profiles, 1, 1, 2, 1);
+    selectors.attach(&profiles_scroll, 1, 1, 2, 1);
     let picture = gtk::Picture::builder()
         .hexpand(true)
         .vexpand(true)
@@ -441,11 +455,17 @@ fn live_view(repository: Rc<SqliteDeviceRepository>) -> gtk::Box {
     controls.append(&test);
     controls.append(&stop);
     controls.append(&status);
-    let session = std::rc::Rc::new(std::cell::RefCell::new(None::<media::LiveSession>));
+    let session = Rc::new(RefCell::new(None::<media::LiveSession>));
+    let generation = Rc::new(Cell::new(0_u64));
     let session_start = session.clone();
     let picture_start = picture.clone();
     let status_start = status.clone();
+    let generation_test = generation.clone();
     test.connect_clicked(move |_| {
+        generation_test.set(generation_test.get().wrapping_add(1));
+        if let Some(mut old) = session_start.borrow_mut().take() {
+            old.stop();
+        }
         match media::LiveSession::new(&picture_start).and_then(|mut value| {
             value.start_test_pattern()?;
             Ok(value)
@@ -459,6 +479,7 @@ fn live_view(repository: Rc<SqliteDeviceRepository>) -> gtk::Box {
     });
     let repository_discover = repository.clone();
     let profiles_discover = profiles.clone();
+    let profile_tokens_discover = profile_tokens.clone();
     let devices_discover = devices.clone();
     let status_discover = status.clone();
     discover.connect_clicked(move |_| {
@@ -481,15 +502,20 @@ fn live_view(repository: Rc<SqliteDeviceRepository>) -> gtk::Box {
         });
         let profiles = profiles_discover.clone();
         let status = status_discover.clone();
+        let profile_tokens = profile_tokens_discover.clone();
         gtk::glib::timeout_add_local(Duration::from_millis(100), move || {
             match receive.try_recv() {
                 Ok(Ok(items)) => {
-                    profiles.remove_all();
+                    while let Some(child) = profiles.first_child() {
+                        profiles.remove(&child);
+                    }
+                    profile_tokens.borrow_mut().clear();
                     for profile in items {
-                        profiles.append(
-                            Some(&profile.token),
+                        profile_tokens.borrow_mut().push(profile.token);
+                        profiles.append(&row(
                             profile.name.as_deref().unwrap_or("Unnamed ONVIF profile"),
-                        );
+                            "ONVIF media profile",
+                        ));
                     }
                     status.set_text("Profiles discovered. Select one and start live view.");
                     gtk::glib::ControlFlow::Break
@@ -509,13 +535,24 @@ fn live_view(repository: Rc<SqliteDeviceRepository>) -> gtk::Box {
     let repository_start = repository.clone();
     let devices_start = devices.clone();
     let profiles_start = profiles.clone();
+    let profile_tokens_start = profile_tokens.clone();
     let session_live = session.clone();
     let picture_live = picture.clone();
     let status_live = status.clone();
+    let generation_live = generation.clone();
     start.connect_clicked(move |_| {
-        let (Some(id), Some(token)) = (devices_start.active_id(), profiles_start.active_id())
-        else {
+        let Some(id) = devices_start.active_id() else {
             status_live.set_text("Select a device and an ONVIF profile first");
+            return;
+        };
+        let token = profiles_start.selected_row().and_then(|row| {
+            profile_tokens_start
+                .borrow()
+                .get(row.index() as usize)
+                .cloned()
+        });
+        let Some(token) = token else {
+            status_live.set_text("Select an ONVIF profile first");
             return;
         };
         let device = repository_start
@@ -527,16 +564,25 @@ fn live_view(repository: Rc<SqliteDeviceRepository>) -> gtk::Box {
             return;
         };
         status_live.set_text("Requesting a live stream URI…");
+        generation_live.set(generation_live.get().wrapping_add(1));
+        let request_generation = generation_live.get();
+        if let Some(mut old) = session_live.borrow_mut().take() {
+            old.stop();
+        }
         let (send, receive) = mpsc::channel();
         std::thread::spawn(move || {
-            let _ = send.send(live_stream_blocking(device, token.to_string()));
+            let _ = send.send(live_stream_blocking(device, token));
         });
         let session = session_live.clone();
         let picture = picture_live.clone();
         let status = status_live.clone();
+        let generation = generation_live.clone();
         gtk::glib::timeout_add_local(Duration::from_millis(100), move || {
             match receive.try_recv() {
                 Ok(Ok((uri, credentials))) => {
+                    if generation.get() != request_generation {
+                        return gtk::glib::ControlFlow::Break;
+                    }
                     match media::LiveSession::new(&picture).and_then(|mut value| {
                         value.start_rtsp(&uri, &credentials)?;
                         Ok(value)
@@ -561,7 +607,9 @@ fn live_view(repository: Rc<SqliteDeviceRepository>) -> gtk::Box {
     retry.connect_clicked(move |_| start_retry.emit_clicked());
     let session_stop = session.clone();
     let status_stop = status.clone();
+    let generation_stop = generation.clone();
     stop.connect_clicked(move |_| {
+        generation_stop.set(generation_stop.get().wrapping_add(1));
         if let Some(mut value) = session_stop.borrow_mut().take() {
             value.stop();
         }
@@ -570,16 +618,24 @@ fn live_view(repository: Rc<SqliteDeviceRepository>) -> gtk::Box {
     let session_events = session.clone();
     let status_events = status.clone();
     gtk::glib::timeout_add_local(Duration::from_millis(250), move || {
-        if let Some(session) = session_events.borrow().as_ref() {
-            for event in session.drain_events() {
-                match event {
-                    media::LiveEvent::Buffering => status_events.set_text("Buffering live video…"),
-                    media::LiveEvent::Playing => status_events
-                        .set_text("RTSP pipeline active; decoded video should be visible"),
-                    media::LiveEvent::EndOfStream => status_events.set_text("Live stream ended"),
-                    media::LiveEvent::Error => status_events
-                        .set_text("GStreamer reported a stream, authentication, or decoding error"),
+        if let Some(session) = session_events.borrow_mut().as_mut() {
+            let diagnostics = session.poll();
+            match diagnostics.state {
+                media::LiveState::Connecting => {
+                    status_events.set_text("Connecting to RTSP stream…")
                 }
+                media::LiveState::Buffering => {
+                    status_events.set_text("RTSP connected; buffering video…")
+                }
+                media::LiveState::ReceivingVideo => {
+                    status_events.set_text("Receiving decoded video")
+                }
+                media::LiveState::Stalled => status_events
+                    .set_text("No decoded video frames arrived before the startup timeout"),
+                media::LiveState::Error => {
+                    status_events.set_text("GStreamer stream, authentication, or decoder error")
+                }
+                media::LiveState::Disconnected => status_events.set_text("Disconnected"),
             }
         }
         gtk::glib::ControlFlow::Continue
