@@ -1,4 +1,4 @@
-use crate::credentials::Credentials;
+use crate::auth::Credentials;
 use async_trait::async_trait;
 use base64::{Engine, engine::general_purpose::STANDARD};
 use chrono::{SecondsFormat, Utc};
@@ -633,7 +633,7 @@ impl<T: SoapTransport> OnvifClient<T> {
         parse_device_information(&response)
     }
 
-    pub(crate) async fn services(&self) -> Result<Vec<ServiceEndpoint>, ProbeError> {
+    pub async fn services(&self) -> Result<Vec<ServiceEndpoint>, ProbeError> {
         let body = format!(
             "<tds:GetServices xmlns:tds=\"{DEVICE_NS}\"><tds:IncludeCapability>true</tds:IncludeCapability></tds:GetServices>"
         );
@@ -667,7 +667,7 @@ impl<T: SoapTransport> OnvifClient<T> {
         parse_media_profiles(&response)
     }
 
-    pub(crate) async fn call_service(
+    pub async fn call_service(
         &self,
         endpoint: &Url,
         action: &str,
@@ -682,7 +682,7 @@ impl<T: SoapTransport> OnvifClient<T> {
             .await
     }
 
-    pub(crate) fn validated_service_endpoint(&self, value: &str) -> Result<Url, ProbeError> {
+    pub fn validated_service_endpoint(&self, value: &str) -> Result<Url, ProbeError> {
         validated_service_endpoint(
             &self.device_endpoint,
             value,
@@ -690,7 +690,7 @@ impl<T: SoapTransport> OnvifClient<T> {
         )
     }
 
-    pub(crate) fn validated_replay_uri(&self, value: &str) -> Result<Url, ProbeError> {
+    pub fn validated_replay_uri(&self, value: &str) -> Result<Url, ProbeError> {
         let uri = Url::parse(value)
             .map_err(|error| ProbeError::Malformed(format!("invalid replay URI: {error}")))?;
         if !matches!(uri.scheme(), "rtsp" | "rtsps") || uri.host_str().is_none() {

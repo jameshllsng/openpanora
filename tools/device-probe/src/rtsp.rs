@@ -1,4 +1,4 @@
-use crate::{credentials::Credentials, onvif::ProbeError};
+use crate::{auth::Credentials, onvif::ProbeError};
 use gst::prelude::*;
 use gstreamer as gst;
 use md5::{Digest, Md5};

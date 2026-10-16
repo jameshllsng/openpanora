@@ -1263,8 +1263,12 @@ checksum = "384b8ab6d37215f3c5301a95a4accb5d64aa607f1fcb26a11b5303878451b4fe"
 name = "openpanora"
 version = "0.1.0"
 dependencies = [
+ "device-probe",
  "gtk4",
+ "keyring",
  "openpanora-core",
+ "tokio",
+ "url",
 ]
 
 [[package]]

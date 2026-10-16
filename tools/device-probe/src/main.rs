@@ -1,9 +1,10 @@
 mod cli;
 mod credentials;
-mod onvif;
 mod output;
 mod recordings;
 mod rtsp;
+
+pub use device_probe::{auth, onvif};
 
 use clap::Parser;
 use cli::{Cli, Command, RecordingsCommand};
